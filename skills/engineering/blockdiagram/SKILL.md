@@ -142,7 +142,16 @@ python3 scripts/graph_to_blockdiagram.py --root <TopModule> --depth 1 -o top.svg
 python3 scripts/graph_to_blockdiagram.py --modules CacheCtrl Xbar CpuTile -o cache.svg
 python3 scripts/graph_to_blockdiagram.py --root CacheCtrl --depth 2 --emit-dsl > diagram.py
 python3 scripts/graph_to_blockdiagram.py --list          # module names in the graph
+python3 scripts/graph_to_blockdiagram.py --root Top --ports -o top.svg
 ```
+
+`--ports` puts each block's interface in its box (`524 in/198 out`, `widest 128b`) and
+scales line weight by the instantiated block's widest port, so a 512-bit block reads as
+a fat bus and a handful of control wires reads as a signal. Two honest limits: the
+weight reflects the width of the block's *interface*, not of the particular connection
+— the parse knows what a module declares, not which wires an instantiation ties
+together — and a parameterised width (`[WIDTH-1:0]`) is simply absent rather than
+guessed at.
 
 Repeat instantiations collapse to one arrow with a count (`x16` for sixteen banks), and
 modules the corpus never defines are drawn as IP — so the boundary of what was extracted

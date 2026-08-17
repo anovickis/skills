@@ -151,6 +151,35 @@ def select(nodes, edges, roots, depth, max_nodes):
     return keep, kept_edges, truncated
 
 
+def _port_desc(node):
+    """Interface summary for a box: how much crosses this boundary.
+
+    Widths come from the graph when the RTL declared them as literals. A parameterised
+    width (`[WIDTH-1:0]`) is not knowable from the parse and is simply absent here
+    rather than guessed -- an invented bit count in a diagram would be believed.
+    """
+    s = node.get("verilog_port_summary")
+    if not s:
+        return None
+    counts = "/".join(f"{s[k]} {k}" for k in ("in", "out", "inout") if s.get(k))
+    lines = [counts] if counts else []
+    if s.get("widest_bits"):
+        lines.append(f"widest {s['widest_bits']}b")
+    return lines or None
+
+
+def _weight_for(node):
+    """Line weight from the instantiated block's widest port.
+
+    This is the width of the block's INTERFACE, not of the particular connection --
+    the parse knows what a module declares, not which wires the instantiation ties
+    together. It reads as "this is a wide block", which is the honest claim.
+    """
+    s = (node or {}).get("verilog_port_summary") or {}
+    b = s.get("widest_bits") or 0
+    return "fat" if b >= 256 else "bus" if b >= 32 else "signal"
+
+
 def _edge_label(e, label_edges):
     """A repeat count is worth showing; the bare relation usually is not."""
     n = e.get("count", 1)
@@ -163,7 +192,7 @@ def _safe(bid):
     return "".join(c if c.isalnum() or c == "_" else "_" for c in bid)
 
 
-def emit_dsl(title, keep, kept_edges, nodes, label_edges):
+def emit_dsl(title, keep, kept_edges, nodes, label_edges, ports=False):
     """The skill's DSL as text, for hand-tuning -- its recommended workflow."""
     lines = [f'import sys; sys.path.insert(0, "{SKILL}")',
              "from blockdiagram import Diagram", "",
@@ -172,11 +201,14 @@ def emit_dsl(title, keep, kept_edges, nodes, label_edges):
         n = nodes[nid]
         kind = "ip" if n.get("external") else "block"
         desc = ["not defined in corpus"] if n.get("external") else None
+        if desc is None and ports:
+            desc = _port_desc(n)
         lines.append(f'd.node({_safe(nid)!r}, {n.get("label", nid)!r}, {desc!r}, kind={kind!r})')
     lines.append("")
     for e in kept_edges:
+        w = _weight_for(nodes.get(e["target"])) if ports else "signal"
         lines.append(f'd.edge({_safe(e["source"])!r}, {_safe(e["target"])!r}, '
-                     f'label={_edge_label(e, label_edges)!r})')
+                     f'label={_edge_label(e, label_edges)!r}, weight={w!r})')
     lines += ["", 'print(d.save("diagram.svg"))']
     return "\n".join(lines)
 
@@ -191,6 +223,9 @@ def main():
     ap.add_argument("-o", "--out", default="diagram.svg", help="output SVG (a PNG is written beside it)")
     ap.add_argument("--emit-dsl", action="store_true", help="print the DSL instead of rendering")
     ap.add_argument("--label-edges", action="store_true", help="label arrows 'instantiates'")
+    ap.add_argument("--ports", action="store_true",
+                    help="show each block's interface (port counts + widest bus) and scale "
+                         "line weight by the instantiated block's widest port")
     ap.add_argument("--max-nodes", type=int, default=DEFAULT_MAX, help=f"box cap (default {DEFAULT_MAX})")
     ap.add_argument("--list", action="store_true", help="list module names in the graph and exit")
     ap.add_argument("--skill-path", help="blockdiagram scripts/ dir (else $BLOCKDIAGRAM_SKILL)")
@@ -237,7 +272,7 @@ def main():
                      + (f", {ext} external (drawn as IP)" if ext else "") + "\n")
 
     if a.emit_dsl:
-        print(emit_dsl(title, keep, kept_edges, nodes, a.label_edges))
+        print(emit_dsl(title, keep, kept_edges, nodes, a.label_edges, a.ports))
         return 0
 
     skill = a.skill_path or SKILL
@@ -250,11 +285,13 @@ def main():
     d = Diagram(title)
     for nid in keep:
         n = nodes[nid]
-        d.node(_safe(nid), n.get("label", nid),
-               ["not defined in corpus"] if n.get("external") else None,
+        desc = ["not defined in corpus"] if n.get("external") else (
+            _port_desc(n) if a.ports else None)
+        d.node(_safe(nid), n.get("label", nid), desc,
                kind="ip" if n.get("external") else "block")
     for e in kept_edges:
-        d.edge(_safe(e["source"]), _safe(e["target"]), label=_edge_label(e, a.label_edges))
+        d.edge(_safe(e["source"]), _safe(e["target"]), label=_edge_label(e, a.label_edges),
+               weight=_weight_for(nodes.get(e["target"])) if a.ports else "signal")
     report = d.save(a.out)
     print(report)
     if any(level == "FAIL" for level, _ in (report or [])):
