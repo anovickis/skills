@@ -142,12 +142,18 @@ def select(nodes, edges, roots, depth, max_nodes):
     # both unreadable and a lint FAIL for stacked parallel segments -- and "x16" says more
     # than sixteen identical lines ever could.
     counts = {}
+    widths = {}
     for e in edges:
         if e.get("relation") != "instantiates":
             continue
+        k = (e["source"], e["target"])
         if e["source"] in sel and e["target"] in sel:
-            counts[(e["source"], e["target"])] = counts.get((e["source"], e["target"]), 0) + 1
-    kept_edges = [{"source": s, "target": t, "count": c} for (s, t), c in counts.items()]
+            counts[k] = counts.get(k, 0) + 1
+            w = e.get("verilog_conn_bits_max")
+            if w:
+                widths[k] = max(widths.get(k, 0), w)
+    kept_edges = [{"source": s, "target": t, "count": c, "bits": widths.get((s, t))}
+                  for (s, t), c in counts.items()]
     return keep, kept_edges, truncated
 
 
@@ -168,24 +174,31 @@ def _port_desc(node):
     return lines or None
 
 
-def _weight_for(node):
-    """Line weight from the instantiated block's widest port.
+def _weight_for(edge, node):
+    """Line weight from the widest thing that actually crosses this connection.
 
-    This is the width of the block's INTERFACE, not of the particular connection --
-    the parse knows what a module declares, not which wires the instantiation ties
-    together. It reads as "this is a wide block", which is the honest claim.
+    `verilog_conn_bits_max` is real: the instantiation names the child's ports and the
+    child declares their widths, so this is the connection, not a proxy. Where the
+    connection is positional or its ports are parameterised, fall back to the block's
+    widest port -- a statement about the block rather than the wire, which is why it is
+    only the fallback.
     """
-    s = (node or {}).get("verilog_port_summary") or {}
-    b = s.get("widest_bits") or 0
+    b = (edge or {}).get("bits")
+    if not b:
+        b = ((node or {}).get("verilog_port_summary") or {}).get("widest_bits") or 0
     return "fat" if b >= 256 else "bus" if b >= 32 else "signal"
 
 
-def _edge_label(e, label_edges):
-    """A repeat count is worth showing; the bare relation usually is not."""
-    n = e.get("count", 1)
-    if n > 1:
-        return f"x{n}" + (" instantiates" if label_edges else "")
-    return "instantiates" if label_edges else None
+def _edge_label(e, label_edges, ports=False):
+    """A repeat count and a bus width are worth showing; the bare relation is not."""
+    bits = []
+    if e.get("count", 1) > 1:
+        bits.append(f"x{e['count']}")
+    if ports and e.get("bits"):
+        bits.append(f"{e['bits']}b")
+    if label_edges:
+        bits.append("instantiates")
+    return " ".join(bits) or None
 
 
 def _safe(bid):
@@ -206,9 +219,9 @@ def emit_dsl(title, keep, kept_edges, nodes, label_edges, ports=False):
         lines.append(f'd.node({_safe(nid)!r}, {n.get("label", nid)!r}, {desc!r}, kind={kind!r})')
     lines.append("")
     for e in kept_edges:
-        w = _weight_for(nodes.get(e["target"])) if ports else "signal"
+        w = _weight_for(e, nodes.get(e["target"])) if ports else "signal"
         lines.append(f'd.edge({_safe(e["source"])!r}, {_safe(e["target"])!r}, '
-                     f'label={_edge_label(e, label_edges)!r}, weight={w!r})')
+                     f'label={_edge_label(e, label_edges, ports)!r}, weight={w!r})')
     lines += ["", 'print(d.save("diagram.svg"))']
     return "\n".join(lines)
 
@@ -290,8 +303,9 @@ def main():
         d.node(_safe(nid), n.get("label", nid), desc,
                kind="ip" if n.get("external") else "block")
     for e in kept_edges:
-        d.edge(_safe(e["source"]), _safe(e["target"]), label=_edge_label(e, a.label_edges),
-               weight=_weight_for(nodes.get(e["target"])) if a.ports else "signal")
+        d.edge(_safe(e["source"]), _safe(e["target"]),
+               label=_edge_label(e, a.label_edges, a.ports),
+               weight=_weight_for(e, nodes.get(e["target"])) if a.ports else "signal")
     report = d.save(a.out)
     print(report)
     if any(level == "FAIL" for level, _ in (report or [])):

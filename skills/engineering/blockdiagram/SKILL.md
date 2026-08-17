@@ -145,13 +145,15 @@ python3 scripts/graph_to_blockdiagram.py --list          # module names in the g
 python3 scripts/graph_to_blockdiagram.py --root Top --ports -o top.svg
 ```
 
-`--ports` puts each block's interface in its box (`524 in/198 out`, `widest 128b`) and
-scales line weight by the instantiated block's widest port, so a 512-bit block reads as
-a fat bus and a handful of control wires reads as a signal. Two honest limits: the
-weight reflects the width of the block's *interface*, not of the particular connection
-— the parse knows what a module declares, not which wires an instantiation ties
-together — and a parameterised width (`[WIDTH-1:0]`) is simply absent rather than
-guessed at.
+`--ports` puts each block's interface in its box (`524 in/198 out`, `widest 128b`),
+labels each arrow with what actually crosses it (`x16 128b`), and scales line weight to
+match — so a 512-bit path reads as a fat bus and a few control wires read as a signal.
+
+The width on an arrow is the real connection: the instantiation names the child's ports
+and the child declares their widths. Where a connection is positional, or its ports are
+parameterised (`[WIDTH-1:0]`), the width is absent rather than guessed and the weight
+falls back to the block's own widest port — a statement about the block, not the wire.
+An invented bit count in a diagram gets believed, which is why none is invented.
 
 Repeat instantiations collapse to one arrow with a count (`x16` for sixteen banks), and
 modules the corpus never defines are drawn as IP — so the boundary of what was extracted
