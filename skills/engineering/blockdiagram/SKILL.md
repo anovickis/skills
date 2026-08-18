@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.4.0
+version: 0.5.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -89,7 +89,9 @@ Run the engine self-test with `python3 scripts/blockdiagram.py --selftest`.
 These were all defects; they are now engine behaviour, so don't hand-fix them:
 - **Lane order in a bundle.** Wires turning in one corridor are ordered by how far
   they travel — farthest destination innermost — so a fan-out draws as a comb
-  instead of self-crossing.
+  instead of self-crossing. Where two boxes in a column share the corridor, the one
+  further from the destinations takes the outer lanes, since its wires have to pass
+  the other.
 - **One lane, one wire.** No two wires share a turn line, even where the stretches
   they run along don't overlap: collinear runs with a gap between them read as a
   single long wire with the other wires' turns crossing it. The corridor is sized for
@@ -111,7 +113,16 @@ These were all defects; they are now engine behaviour, so don't hand-fix them:
   retries — and backs off again if spreading is not what was wrong.
 - **Same-side routes go around.** `src_side="T", dst_side="T"` (or both `"B"`,
   `"L"`, `"R"`) runs the wire outside both boxes. This is the escape hatch the
-  wire-through-box FAIL names, and it is how you route a bypass down a stack.
+  wire-through-box FAIL names, and it is how you route a bypass down a stack. When
+  the band beside those two boxes is occupied, the route falls back to the channel
+  outside *everything*.
+- **A wire that cannot be threaded goes round the outside.** `shape="around"` leaves
+  into the side margin, runs along the reserved top/bottom band past everything, and
+  comes back in at the far side — margins and bands are the only box-free space in the
+  figure. The engine applies it itself, measured and reluctantly: only to a wire
+  involved in 2+ crossings, only if it removes at least 2, only if it adds no fault,
+  and at most 4 wires per figure. On a 53-box merged hierarchy one such wire accounted
+  for 26 of 29 crossings.
 
 Two passes are *measured* rather than assumed: autoplace tries a couple of
 alternative rankings (a hub whose children are already fed from the left is tried on

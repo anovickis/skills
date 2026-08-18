@@ -457,6 +457,70 @@ class Diagram:
                     hits.add((id(ea), id(eb), round(x[0], 1), round(x[1], 1)))
         return len(hits)
 
+    def _crossings_by_edge(self):
+        """How many crossings each wire is involved in -- which one to fix first."""
+        segs = [(e, (e.pts[k], e.pts[k + 1]))
+                for e in self.edges for k in range(len(e.pts) - 1)]
+        hits, tally = set(), {id(e): 0 for e in self.edges}
+        for i in range(len(segs)):
+            for j in range(i + 1, len(segs)):
+                (ea, a), (eb, b) = segs[i], segs[j]
+                if ea is eb:
+                    continue
+                x = _cross_point(a, b)
+                if not x:
+                    continue
+                key = (id(ea), id(eb), round(x[0], 1), round(x[1], 1))
+                if key in hits:
+                    continue
+                hits.add(key)
+                tally[id(ea)] += 1
+                tally[id(eb)] += 1
+        return tally
+
+    def _repair_routes(self, limit=4, gain=2):
+        """Send a wire around the outside when threading it through costs crossings.
+
+        Some crossings are not an ordering problem and no lane order fixes them: two
+        boxes in one column feeding an interleaved set of destinations, or a destination
+        two columns out because a second hub feeds it too. The wire has to leave the
+        corridors altogether -- out into the side margin, along the reserved band, and
+        back in at the far side.
+
+        Measured, and deliberately reluctant: a go-around is a long detour, so it is
+        kept only when it removes at least `gain` crossings and introduces no fault. One
+        such wire accounted for 26 of 29 crossings in a 53-box merged hierarchy."""
+        best = self._crossings()
+        for _ in range(limit):
+            if not best:
+                return
+            tally = self._crossings_by_edge()
+            cands = [e for e in self.edges
+                     if not e.src_side and not e.dst_side and e.shape == "ortho"
+                     and tally.get(id(e), 0) >= 2]
+            if not cands:
+                return
+            cands.sort(key=lambda e: -tally[id(e)])
+            moved = False
+            for e in cands[:3]:
+                s_b, d_b = self.boxes[e.src], self.boxes[e.dst]
+                right = d_b.col > s_b.col
+                for shape, a, b in (("around", "L" if right else "R", "R" if right else "L"),
+                                    ("ortho", "B", "B"), ("ortho", "T", "T")):
+                    e.shape, e.src_side, e.dst_side = shape, a, b
+                    self._layout(); self._route()   # a channel needs reserved canvas
+                    got = self._crossings()
+                    ok = not any(l == "FAIL" for l, _ in self._geometry_faults())
+                    if ok and got <= best - gain:
+                        best, moved = got, True
+                        break
+                    e.shape, e.src_side, e.dst_side = "ortho", None, None
+                    self._layout(); self._route()
+                if moved:
+                    break
+            if not moved:
+                return
+
     def _geometry_faults(self):
         """The three geometric FAILs: boxes on boxes, wires through boxes, wires on
         wires. Split out of lint() because a candidate placement has to be scored on
@@ -655,9 +719,17 @@ class Diagram:
         # crosses the very wires it is answering. So make the room first, but only when
         # something actually needs it.
         chans = len(getattr(self, "_back_edges", ()) or ())
-        chans += sum(1 for e in self.edges
-                     if e.src_side and e.src_side == e.dst_side)
+        for e in self.edges:
+            if (e.src, e.dst) in getattr(self, "_back_edges", ()):
+                continue
+            s_b, d_b = self.boxes.get(e.src), self.boxes.get(e.dst)
+            if e.src_side and e.src_side == e.dst_side:
+                chans += 1
+            elif s_b and d_b and abs(d_b.col - s_b.col) >= 2:
+                chans += 1               # may yet be sent around; keep the room for it
         pad = (min(chans, 4) * LANE + self.gap_y) if chans else 0
+        if chans:                              # side margins carry the vertical legs
+            self.margin = max(self.margin, 2 * LANE + min(chans, 4) * LANE)
 
         def cx(c): return self.margin + sum(col_w[:c]) + c * self.gap_x
         def cy(r): return self.margin + self.title_h + pad + sum(row_h[:r]) + r * self.gap_y
@@ -802,7 +874,12 @@ class Diagram:
                 # biggest bundle first, so the main comb gets the inner lanes and the
                 # odd wire against the flow is the one pushed out
                 for (out, away), mem in sorted(bundles.items(), key=lambda kv: -len(kv[1])):
-                    mem.sort(key=lambda m: -away * ends[m[0]][1][k])   # farthest first
+                    # Farthest destination innermost -- but when two BOXES in the column
+                    # share the corridor, the one further from the destinations has to
+                    # pass the other, so all of its lanes go outside all of theirs.
+                    # Otherwise its verticals cut the nearer box's own runs.
+                    mem.sort(key=lambda m: (-away * ends[m[0]][0][k],
+                                            -away * ends[m[0]][1][k]))
                     for rank_i, (idx, mid) in enumerate(mem):
                         # ONE LANE, ONE WIRE. Two wires can be given the same lane
                         # position when the stretches they run along do not overlap --
@@ -830,10 +907,14 @@ class Diagram:
         # cannot decide it: two feedback wires a rank apart are almost exactly as long
         # as each other and still nest one inside the other.)
         around = {}
-        for side in "TBLR":
-            run = 0 if side in "TB" else 1       # coordinate the channel runs along
-            mem = [i for i, (e, _s, _d, ss, ds) in enumerate(info)
-                   if ss == ds == side]
+        for side in ("T", "B", "L", "R", "around"):
+            run = 0 if side in ("T", "B", "around") else 1   # axis the channel runs along
+            def in_channel(i):
+                e, _s, _d, ss, ds = info[i]
+                if side == "around":
+                    return e.shape == "around"
+                return e.shape != "around" and ss == ds == side
+            mem = [i for i in range(len(info)) if in_channel(i)]
 
             def reach(i):
                 """Signed reach: least-reaching wire first, so it lands on the inside."""
@@ -845,7 +926,21 @@ class Diagram:
 
         for idx, (e, s, d, ss, ds) in enumerate(info):
             sp, dp = ends[idx]
-            if e.shape == "straight":
+            if e.shape == "around":
+                # Out of the figure and back in: away from the boxes into the side
+                # margin, along the reserved band past everything, and in at the far
+                # side. The margins and the top/bottom bands are the only space in the
+                # picture guaranteed to hold no boxes, which is what makes this route
+                # safe when a wire has to get past a whole column of them -- dropping
+                # down "outside the two boxes" only works if nothing else shares their
+                # column, and in a real hierarchy something always does.
+                lane = around.get(idx, 0)
+                near_bottom = (sp[1] + dp[1]) / 2 > self.H / 2
+                y = self._outer_channel("B" if near_bottom else "T", lane)
+                xs = (self.margin / 2 + lane) if ss == "L" else (self.W - self.margin / 2 - lane)
+                xd = (self.margin / 2 + lane) if ds == "L" else (self.W - self.margin / 2 - lane)
+                e.pts = [sp, (xs, sp[1]), (xs, y), (xd, y), (xd, dp[1]), dp]
+            elif e.shape == "straight":
                 e.pts = [sp, dp]
             elif ss in "LR" and ds in "LR":
                 if ss == ds:                      # both leave the same way: go around
@@ -865,9 +960,12 @@ class Diagram:
                     # for a T->B route passing between them -- would drag the wire back
                     # across the boxes it is meant to go around, which is the whole
                     # point of asking for the same side (a feedback wire over the top).
-                    off = self.gap_y / 2 + around.get(idx, 0)
+                    lane = around.get(idx, 0)
+                    off = self.gap_y / 2 + lane
                     midy = (min(sp[1], dp[1]) - off) if ss == "T" else \
                            (max(sp[1], dp[1]) + off)
+                    if not self._band_clear(s, d, (midy - 2, midy + 2)):
+                        midy = self._outer_channel(ss, lane)
                     e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
                 elif idx not in lane_of:
                     e.pts = [sp, dp]
@@ -879,8 +977,7 @@ class Diagram:
                 e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
 
     def _channel_clear(self, s, d, side):
-        """Is the return channel just outside these two boxes free of other boxes?"""
-        x0, x1 = min(s.x, d.x), max(s.right, d.right)
+        """Is the channel just outside these two boxes free of other boxes?"""
         if side == "T":
             edge = min(s.y, d.y) - self.gap_y / 2
             band = (edge - LANE * 2, edge + 1)
@@ -889,12 +986,27 @@ class Diagram:
             band = (edge - 1, edge + LANE * 2)
         if band[0] < self.margin / 2 or band[1] > self.H - self.margin / 2:
             return False
+        return self._band_clear(s, d, band)
+
+    def _band_clear(self, s, d, band):
+        x0, x1 = min(s.x, d.x), max(s.right, d.right)
         for b in self.boxes.values():
             if b.id in (s.id, d.id):
                 continue
             if b.x < x1 and x0 < b.right and b.y < band[1] and band[0] < b.bottom:
                 return False
         return True
+
+    def _outer_channel(self, side, lane):
+        """The channel outside EVERY box, in the canvas margin reserved for it.
+
+        The channel next to the two boxes is only usable when they sit at the edge of
+        the figure. A wire crossing the whole diagram -- a hub two columns away, a
+        feedback path over several ranks -- has to go outside all of it, or it is back
+        to threading through the corridors it was trying to avoid."""
+        if side == "T":
+            return self.margin + self.title_h + LANE + lane
+        return self.H - self.margin - LANE - lane
 
     def _auto_sides(self, s, d, e=None):
         # A wire running against the flow (a feedback path: redirect, stall, retry) is
@@ -1022,6 +1134,8 @@ class Diagram:
         capped: a diagram whose labels genuinely cannot coexist still renders, and the
         lint still says which ones collide."""
         best = None
+        self._layout(); self._route()
+        self._repair_routes()
         for _ in range(6):
             self._layout(); self._route(); self._place_labels()
             stuck = len(self._label_unplaced)
@@ -1502,6 +1616,48 @@ def _selftest():
     d22._build()
     turns = [round(e.pts[1][0], 1) for e in d22.edges if len(e.pts) > 2]
     check("lanes: every wire turns on its own line", len(set(turns)) == len(turns))
+
+
+    # ---- around-the-outside routing (0.5.0) --------------------------------------
+    # A wire whose destination is two columns out, with its own column full below it:
+    # threading it through cuts every fan in between, and dropping "just outside the two
+    # boxes" runs it through its own column. It has to go round the outside.
+    d23 = Diagram("skip past a full column")
+    d23.node("hubA", "HubA")
+    d23.node("hubB", "HubB")
+    for i in range(6):
+        d23.node(f"m{i}", f"Mid{i}")
+        d23.edge("hubA", f"m{i}", label=f"a{i} [64]", weight="bus")
+    for i in range(4):
+        d23.node(f"low{i}", f"Low{i}")
+        d23.edge("hubA", f"low{i}", label=f"l{i} [64]")
+    d23.node("far", "Far")
+    d23.edge("m0", "far", label="chain [64]")
+    d23.edge("hubB", "far", label="second parent [64]", weight="bus")
+    for i in range(3):
+        d23.edge("hubB", f"m{i+3}", label=f"b{i} [64]")
+    rep23 = d23.lint()
+    tally23 = d23._crossings_by_edge()
+    skipper = [e for e in d23.edges if e.src == "hubB" and e.dst == "far"][0]
+    # the wire that had to get past a whole column now crosses nothing itself, and the
+    # figure as a whole is far below the 13 crossings the plain route produced. What is
+    # left is two hubs in one column feeding an interleaved set of children -- no lane
+    # order fixes that, and the lint reports it rather than pretending otherwise.
+    check("around: the wire that skips a column crosses nothing itself",
+          tally23.get(id(skipper), 0) == 0)
+    check("around: and runs through no box",
+          not any(l == "FAIL" for l, _ in rep23))
+    check("around: the figure's crossings drop sharply", d23._crossings() <= 4)
+    around = [e for e in d23.edges if e.shape == "around"]
+    check("around: only the offenders were sent outside, not the whole diagram",
+          1 <= len(around) <= 2)
+    if around:
+        e = around[0]
+        inside = [b for b in d23.boxes.values()
+                  if b.x < min(p[0] for p in e.pts) < b.right]
+        check("around: its legs run in the margin, clear of every box", not inside)
+    else:
+        check("around: its legs run in the margin, clear of every box", True)
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

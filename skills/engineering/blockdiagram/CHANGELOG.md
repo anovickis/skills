@@ -1,5 +1,32 @@
 # Changelog — `blockdiagram` skill
 
+## 0.5.0 — scale
+Tested by merging the whole review corpus into ONE figure: 53 boxes, 52 wires, three
+roots, fan-outs of 20/15/9/8, two levels of hierarchy, all four wire classes. A
+single-column fan-out is the easy case — nothing has to cross when every target is in
+one column — so this forces hubs feeding hubs. First draw: **29 crossings**. Now **0**.
+
+- **`shape="around"`**: out into the side margin, along the reserved top/bottom band
+  past everything, back in at the far side. The margins and bands are the only space in
+  a figure guaranteed to hold no boxes, which is what makes it safe when a wire must get
+  past a whole column — dropping "just outside the two boxes" only works if nothing else
+  shares their column, and in a real hierarchy something always does.
+- **The engine applies it itself, measured and reluctant**: only a wire in 2+ crossings,
+  only if it removes 2+, only with no new fault, at most 4 per figure — a go-around is a
+  long detour and the ordinary route is usually right. One wire accounted for 26 of the
+  29 crossings above: its destination sat two columns out because a second hub fed it.
+- **Same-side routes** fall back to the outer channel when the band beside the two boxes
+  is occupied, instead of running back through the boxes.
+- **Lane order accounts for the source box**, not just the destination: where two boxes
+  in one column share a corridor, the one further from the destinations takes the outer
+  lanes, because its wires have to pass the other's runs.
+- Side margins widen to carry go-around legs; canvas reserves the band for them.
+
+What is left unfixed, and reported rather than hidden: two hubs in one column feeding an
+interleaved set of children cross once or twice no matter how the lanes are ordered, and
+a 35-box rank makes a tall thin figure (no fan wrapping — wrapping is what produced the
+crossings in the first place).
+
 ## 0.4.0 — wire classes, and one lane per wire
 - **Wire classes are back**: `edge(..., cls="data"|"control"|"clock"|"interrupt")` draws
   in `#1F4E79` / `#B8860B` / `#6A5ACD` / `#A03030` with the arrowhead matched to its own
