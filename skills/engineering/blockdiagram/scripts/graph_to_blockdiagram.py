@@ -158,20 +158,22 @@ def select(nodes, edges, roots, depth, max_nodes):
 
 
 def _port_desc(node):
-    """Interface summary for a box: how much crosses this boundary.
+    """What to write inside a box, beyond its name.
 
-    Widths come from the graph when the RTL declared them as literals. A parameterised
-    width (`[WIDTH-1:0]`) is not knowable from the parse and is simply absent here
-    rather than guessed -- an invented bit count in a diagram would be believed.
+    NOT the port counts. "24 in/20 out, widest 128b" answers a question the wires
+    already answer, and answers it in a way that invites the wrong arithmetic -- an
+    arrow reading `x4 128b` next to a box reading `widest 128b` looks like it might
+    mean 512b, and does not. Anything derivable from the edges belongs on the edges.
+
+    What is worth saying inside a box is what the wires CANNOT say: that a block is
+    outside the corpus, or what a named instance is an instance of.
     """
-    s = node.get("verilog_port_summary")
-    if not s:
-        return None
-    counts = "/".join(f"{s[k]} {k}" for k in ("in", "out", "inout") if s.get(k))
-    lines = [counts] if counts else []
-    if s.get("widest_bits"):
-        lines.append(f"widest {s['widest_bits']}b")
-    return lines or None
+    if node.get("external"):
+        return ["not defined in corpus"]
+    inst = node.get("chisel_instance_of") or node.get("firrtl_instance_of")
+    if inst and node.get("label", "").startswith(f"{node.get('chisel_instance_name', '')}:"):
+        return None                      # the label already reads "name: Type"
+    return None
 
 
 def _weight_for(edge, node):
@@ -213,9 +215,7 @@ def emit_dsl(title, keep, kept_edges, nodes, label_edges, ports=False):
     for nid in keep:
         n = nodes[nid]
         kind = "ip" if n.get("external") else "block"
-        desc = ["not defined in corpus"] if n.get("external") else None
-        if desc is None and ports:
-            desc = _port_desc(n)
+        desc = _port_desc(n)
         lines.append(f'd.node({_safe(nid)!r}, {n.get("label", nid)!r}, {desc!r}, kind={kind!r})')
     lines.append("")
     for e in kept_edges:
@@ -242,6 +242,9 @@ def main():
     ap.add_argument("--max-nodes", type=int, default=DEFAULT_MAX, help=f"box cap (default {DEFAULT_MAX})")
     ap.add_argument("--list", action="store_true", help="list module names in the graph and exit")
     ap.add_argument("--skill-path", help="blockdiagram scripts/ dir (else $BLOCKDIAGRAM_SKILL)")
+    ap.add_argument("--verify", action="store_true",
+                    help="read the finished SVG back and check every connection in the "
+                         "data is recoverable from the picture")
     a = ap.parse_args()
 
     if not os.path.exists(a.graph):
@@ -298,8 +301,7 @@ def main():
     d = Diagram(title)
     for nid in keep:
         n = nodes[nid]
-        desc = ["not defined in corpus"] if n.get("external") else (
-            _port_desc(n) if a.ports else None)
+        desc = _port_desc(n)
         d.node(_safe(nid), n.get("label", nid), desc,
                kind="ip" if n.get("external") else "block")
     for e in kept_edges:
@@ -308,6 +310,21 @@ def main():
                weight=_weight_for(e, nodes.get(e["target"])) if a.ports else "signal")
     report = d.save(a.out)
     print(report)
+    if a.verify:
+        # Read the picture back. Lint says the geometry is sound; this says the diagram
+        # still means what the data meant, which is a different and stronger question.
+        import json as _json
+        import subprocess as _sp
+        import tempfile as _tf
+        labels = {_safe(nid): nodes[nid].get("label", nid) for nid in keep}
+        want = [[labels[_safe(e["source"])], labels[_safe(e["target"])]]
+                for e in kept_edges]
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            _json.dump(want, fh)
+            expect = fh.name
+        r = _sp.run([sys.executable, os.path.join(skill, "verify_diagram.py"),
+                     a.out, "--expect", expect], capture_output=True, text=True)
+        sys.stderr.write(r.stdout + r.stderr)
     if any(level == "FAIL" for level, _ in (report or [])):
         sys.stderr.write(
             "\nlint FAILED: a wide fan-out does not lay out well automatically. Autoplace is "

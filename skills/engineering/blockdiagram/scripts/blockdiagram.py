@@ -22,6 +22,7 @@ segments, arrowhead size, glyphs missing from the font). Always eyeball the PNG.
 
 Self-test:  python3 blockdiagram.py --selftest
 """
+import math
 import os, subprocess, sys
 
 # ---- house palette / sizes ----------------------------------------------
@@ -37,6 +38,7 @@ FS_SMALL = 10
 FS_PORT = 9
 PAD = 12
 ARROW = 8
+WIRE_PITCH = 22     # vertical room reserved per wire attached to a box
 LANE = 8           # spacing between parallel runs in a corridor
 # line weight encodes cardinality (THREE tiers only):
 #   signal = one wire (1 px) · bus = a little wider · fat = a fat bus (much wider)
@@ -131,8 +133,9 @@ class _Box:
         return max(widths, default=0) + 2 * PAD
 
     def need_h(self):
+        # honoured by the caller below via max(); see _layout's wire-pitch reservation
         n = (1 if self.label else 0) + len(self.desc) + (1 if self.title else 0)
-        return n * (FS_DESC + 6) + 2 * PAD + 6
+        return max(n * (FS_DESC + 6) + 2 * PAD + 6, getattr(self, 'min_h', 0))
 
     @property
     def cx(self): return self.x + self.w / 2
@@ -180,7 +183,7 @@ class _Edge:
 
 
 class Diagram:
-    def __init__(self, title, cols=None, rows=None, gap_x=46, gap_y=26,
+    def __init__(self, title, cols=None, rows=None, gap_x=72, gap_y=44,
                  margin=24, title_h=34):
         self.title = title
         self.ncol, self.nrow = cols, rows
@@ -267,14 +270,29 @@ class Diagram:
 
         # 3. assign cells; centre each column vertically for balance. Columns are
         # re-indexed densely so empty ranks (left by tightening) don't appear.
-        nrow = max((len(v) for v in ranks.values()), default=1)
-        for col, r in enumerate(sorted(ranks)):
+        #
+        # A WIDE RANK IS WRAPPED over several columns. A fan-out puts every child at
+        # the same rank, so one parent with eleven children became an eleven-row strip:
+        # aspect 0.3:1, every wire from the parent running the length of the column, and
+        # fourteen lint failures for wires crossing boxes. There was no free corridor
+        # because the column WAS the corridor. Wrapping keeps the diagram near-square,
+        # which is both easier to read and leaves the router somewhere to go.
+        cap = max(3, int(math.ceil(math.sqrt(max(len(ids), 1)))))
+        chunked = []                       # [(rank, [ids])] in column order
+        for r in sorted(ranks):
             lst = ranks[r]
+            if len(lst) > cap:
+                for i in range(0, len(lst), cap):
+                    chunked.append((r, lst[i:i + cap]))
+            else:
+                chunked.append((r, lst))
+        nrow = max((len(c) for _, c in chunked), default=1)
+        for col, (_, lst) in enumerate(chunked):
             off = (nrow - len(lst)) // 2
             for k, i in enumerate(lst):
                 self.boxes[i].col = col
                 self.boxes[i].row = off + k
-        self.ncol, self.nrow = len(ranks), nrow
+        self.ncol, self.nrow = len(chunked), nrow
 
     def _crossings(self):
         """Count edge crossings between adjacent columns (lower = cleaner)."""
@@ -292,6 +310,23 @@ class Diagram:
     def _layout(self):
         if any(b.col is None for b in self.boxes.values()):
             self.autoplace()
+        # A box must be tall enough for the wires attached to it. Eight wires leaving a
+        # 40px box put their anchors ~5px apart, so their labels land on top of one
+        # another and the picture stops saying which wire is which. Reserve a pitch per
+        # attachment on the busier side; the box grows, the anchors spread, the labels
+        # fit. Counted before sides are assigned, so it uses in/out counts as the proxy.
+        incoming, outgoing = {}, {}
+        for e in self.edges:
+            outgoing[e.src] = outgoing.get(e.src, 0) + 1
+            incoming[e.dst] = incoming.get(e.dst, 0) + 1
+        for bid, b in self.boxes.items():
+            n = max(incoming.get(bid, 0), outgoing.get(bid, 0))
+            if n > 1:
+                # Enough for one pitch per wire plus a margin. A larger reservation
+                # was tried on the theory that slack would let wires straighten; it
+                # did not -- straightness is set by where anchors AIM, not by how much
+                # room they have -- and it only made boxes enormous.
+                b.min_h = max(getattr(b, "min_h", 0), n * WIRE_PITCH + 12)
         # widen horizontal gaps so an edge label sits over the wire without
         # bumping either box (a label needs room in the corridor between cols).
         max_lbl = max((_tw(e.label, FS_SMALL) for e in self.edges if e.label), default=0)
@@ -320,6 +355,8 @@ class Diagram:
         self.H = cy(self.nrow) - self.gap_y + self.margin
 
     def _route(self):
+        self._vgap_cache = None
+        self._hgap_cache = None
         # pass 1: pick a side for each edge end
         info = []
         for e in self.edges:
@@ -349,6 +386,42 @@ class Diagram:
                 return ob.cy if side in "LR" else ob.cx
             mem.sort(key=other_coord)
             k = len(mem)
+            # Where each wire WANTS to leave: level with the box at the other end, so
+            # the wire can run straight. Even fractions of the box height gave every
+            # anchor an arbitrary position that matched nothing -- making boxes taller
+            # simply scaled both ends and left straightness unchanged (measured: 9%).
+            # Preferences are then separated by a minimum pitch, in preference order,
+            # so wires that can be straight are and the rest stay ordered and distinct.
+            if k > 1:
+                lo = (box.y if side in "LR" else box.x) + 10
+                hi = (box.bottom if side in "LR" else box.right) - 10
+                want = []
+                for idx, end in mem:
+                    ob = info[idx][2] if end == "s" else info[idx][1]
+                    want.append(min(max(ob.cy if side in "LR" else ob.cx, lo), hi))
+                span = max(hi - lo, 1)
+                pitch = min(WIRE_PITCH, span / max(k - 1, 1))
+                placed = []
+                for v in want:
+                    if placed and v < placed[-1] + pitch:
+                        v = placed[-1] + pitch
+                    placed.append(v)
+                if placed and placed[-1] > hi:            # slid past the end: shift back
+                    shift = placed[-1] - hi
+                    placed = [v - shift for v in placed]
+                # An anchor MUST end up on its own box. Shifting the run back could push
+                # the first entries above `lo`, putting the wire's start outside the box
+                # it belongs to -- the wire then began in empty space, which reading the
+                # finished SVG back is what exposed. Geometry lint never saw it, because
+                # a wire floating beside a box crosses nothing. If the run cannot fit,
+                # spread evenly across the side instead of letting anything escape.
+                if placed and (placed[0] < lo - 0.01 or placed[-1] > hi + 0.01):
+                    placed = [lo + j * span / max(k - 1, 1) for j in range(k)]
+                for (idx, end), v in zip(mem, placed):
+                    if side in "LR":
+                        anchor[(idx, end)] = (box.x if side == "L" else box.right, v)
+                    else:
+                        anchor[(idx, end)] = (v, box.y if side == "T" else box.bottom)
             for j, (idx, end) in enumerate(mem):
                 ob = info[idx][2] if end == "s" else info[idx][1]
                 if k == 1:                        # straighten to the other box
@@ -360,14 +433,8 @@ class Diagram:
                         oc = _overlap_center(box.x, box.right, ob.x, ob.right)
                         x = oc if oc is not None else box.cx
                         anchor[(idx, end)] = (x, box.y if side == "T" else box.bottom)
-                else:                             # fan across the side
-                    f = (j + 1) / (k + 1)
-                    if side in "LR":
-                        anchor[(idx, end)] = (box.x if side == "L" else box.right,
-                                              box.y + f * box.h)
-                    else:
-                        anchor[(idx, end)] = (box.x + f * box.w,
-                                              box.y if side == "T" else box.bottom)
+                else:                             # several wires on one side
+                    pass                          # positions assigned below, together
 
         # pass 3: build orthogonal (or straight) point lists
         corridor = {}
@@ -380,11 +447,10 @@ class Diagram:
                 if abs(sp[1] - dp[1]) < 1:
                     e.pts = [sp, dp]
                 else:
-                    midx = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
-                    bucket = round(midx / LANE)
-                    lane = corridor.get(bucket, 0); corridor[bucket] = lane + 1
-                    midx += lane * LANE * (1 if ss == "R" else -1)
-                    e.pts = [sp, (midx, sp[1]), (midx, dp[1]), dp]
+                    default = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
+                    pts = self._ortho_route(sp, dp, default, {s.id, d.id},
+                                            1 if ss == "R" else -1, corridor)
+                    e.pts = pts
             elif ss in "TB" and ds in "TB":
                 if abs(sp[0] - dp[0]) < 1:
                     e.pts = [sp, dp]
@@ -394,6 +460,137 @@ class Diagram:
             else:
                 midy = (sp[1] + dp[1]) / 2
                 e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
+
+    def _vgaps(self):
+        """Vertical corridors: x centres of the free columns between boxes.
+
+        Cached per layout. These are the lanes a wire can run down without passing
+        through anything -- the gutters the grid already leaves between columns.
+        """
+        if getattr(self, "_vgap_cache", None) is not None:
+            return self._vgap_cache
+        spans = sorted((b.x, b.right) for b in self.boxes.values())
+        gaps, cur = [], None
+        for x0, x1 in spans:
+            if cur is None:
+                cur = [x0, x1]
+                continue
+            if x0 > cur[1]:
+                gaps.append((cur[1], x0))
+                cur = [x0, x1]
+            else:
+                cur[1] = max(cur[1], x1)
+        out = [(a + b) / 2 for a, b in gaps if b - a > 6]
+        if spans:
+            out.append(spans[0][0] - self.gap_x / 2)      # left of everything
+            out.append(spans[-1][1] + self.gap_x / 2)     # right of everything
+        self._vgap_cache = out
+        return out
+
+    def _hgaps(self):
+        """Horizontal corridors: y centres of the free bands between rows."""
+        if getattr(self, "_hgap_cache", None) is not None:
+            return self._hgap_cache
+        spans = sorted((b.y, b.bottom) for b in self.boxes.values())
+        gaps, cur = [], None
+        for y0, y1 in spans:
+            if cur is None:
+                cur = [y0, y1]
+                continue
+            if y0 > cur[1]:
+                gaps.append((cur[1], y0))
+                cur = [y0, y1]
+            else:
+                cur[1] = max(cur[1], y1)
+        out = [(a + b) / 2 for a, b in gaps if b - a > 6]
+        if spans:
+            # Above the first row, but BELOW the title -- a corridor at the very top
+            # drew wires straight through the diagram's own heading.
+            top = spans[0][0] - self.gap_y / 2
+            if top > self.title_h + 6:
+                out.append(top)
+            out.append(spans[-1][1] + self.gap_y / 2)
+        self._hgap_cache = out
+        return out
+
+    def _ortho_route(self, sp, dp, default, skip_ids, sign, corridor):
+        """An orthogonal path from sp to dp that does not pass under a box.
+
+        Tries the cheap shape first and only escalates:
+
+          3 segments   out to a vertical gutter, along it, in to the target
+          5 segments   out to a gutter, along it to a clear HORIZONTAL band,
+                       across, then into the target
+
+        The 3-segment form cannot succeed when the target is several columns away,
+        because its final horizontal run has to cross the intervening columns at the
+        target's own height, and that is exactly where their boxes are. That is why
+        wires were being drawn under blocks: not a bad choice of gutter, but a shape
+        with nowhere legal to go. The 5-segment form leaves the row band entirely and
+        travels in a gutter between rows.
+
+        Falls back to the original 3-segment path when nothing is clear, so the result
+        is never worse than before and the lint still reports it.
+        """
+        obstacles = [b for b in self.boxes.values() if b.id not in skip_ids]
+
+        def lane_shift(mx):
+            bucket = round(mx / LANE)
+            lane = corridor.get(bucket, 0)
+            corridor[bucket] = lane + 1
+            return mx + lane * LANE * sign
+
+        def clear(pts):
+            segs = list(zip(pts, pts[1:]))
+            return not any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
+
+        # 1. three segments, preferring the gutter nearest the default
+        cands = [default] + sorted(self._vgaps(), key=lambda x: abs(x - default))
+        for mx in cands:
+            pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
+            if clear(pts):
+                mx = lane_shift(mx)
+                return [sp, (mx, sp[1]), (mx, dp[1]), dp]
+
+        # 2. five segments: out, along a row band, in
+        for mx in cands:
+            # The exit corridor should be the one nearest the TARGET. Sorting by
+            # distance from the entry corridor sent wires out to the far edge of the
+            # drawing and back, which is contained but absurd.
+            for ex in sorted(self._vgaps(), key=lambda x: abs(x - dp[0])):
+                for my in sorted(self._hgaps(), key=lambda y: abs(y - (sp[1] + dp[1]) / 2)):
+                    pts = [sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp]
+                    if clear(pts):
+                        return pts
+        return [sp, (lane_shift(default), sp[1]), (lane_shift(default), dp[1]), dp]
+
+    def _clear_vgap(self, sp, dp, default, skip_ids):
+        """Pick a vertical corridor whose three segments miss every box.
+
+        The router used to take the gutter immediately beside the source and commit to
+        it. When that gutter was occupied further along -- which is what happens the
+        moment one box feeds several -- the wire was drawn straight THROUGH whatever
+        stood in the way, and the lint duly reported a wire crossing a box with no way
+        for the engine to avoid it. Now the candidate gutters are tried in order of
+        distance from that first choice and the first clear one wins.
+
+        If none is clear the default is kept, so the drawing is never worse than before
+        and the lint still says so rather than the failure being hidden.
+        """
+        obstacles = [b for b in self.boxes.values() if b.id not in skip_ids]
+        if not obstacles:
+            return default
+
+        def clear(mx):
+            segs = [(sp, (mx, sp[1])), ((mx, sp[1]), (mx, dp[1])), ((mx, dp[1]), dp)]
+            return not any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
+
+        if clear(default):
+            return default
+        for cand in sorted(self._vgaps(), key=lambda x: abs(x - default)):
+            if clear(cand):
+                return cand
+        return default
 
     @staticmethod
     def _auto_sides(s, d):
@@ -417,19 +614,38 @@ class Diagram:
     # ---- emit ------------------------------------------------------------
     def _svg(self):
         self._layout(); self._route()
+        # Grow the canvas to whatever the router actually used. Detour corridors can sit
+        # outside the box extents -- that is the point of them -- and the width computed
+        # from the grid alone left those wires running off the edge of the drawing.
+        for e in self.edges:
+            for x, y in e.pts:
+                self.W = max(self.W, x + self.margin)
+                self.H = max(self.H, y + self.margin)
         o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.W:.0f}" '
              f'height="{self.H:.0f}" viewBox="0 0 {self.W:.0f} {self.H:.0f}" font-family="Arial">']
-        # one arrowhead marker per distinct line weight; head scales modestly
-        # with weight (markerUnits=userSpaceOnUse so it does NOT blow up with it)
+        # One arrowhead marker per line weight. Two things this gets right that the
+        # previous version did not:
+        #
+        #   SYMMETRY. The old triangle was (0,0) (L,h/2) (0,h-2): the tip sat at h/2
+        #   while the base ran 0..h-2, so its midpoint was (h-2)/2. The head was skewed
+        #   by exactly one unit and refY aligned the tip rather than the axis, which is
+        #   why arrowheads looked off-centre against their wire. The base is now
+        #   symmetric about refY, so the head's axis IS the wire's centreline.
+        #
+        #   PROPORTION. A 6px bus with a 9px head reads as a skinny dart on a fat wire.
+        #   The base is now at least 2.6x the stroke, so a heavy wire gets a head that
+        #   looks like it belongs to it, while a 1px signal keeps the small tasteful one.
         weights = sorted({e.weight for e in self.edges})
         defs = ['<defs>']
         for w in weights:
-            h = ARROW + w                      # modest growth, not linear-with-stroke
+            base = max(ARROW + 1.4 * w, 2.6 * w)      # across the wire
+            length = base * 1.15                      # along it
             defs.append(
                 f'<marker id="arr{_wkey(w)}" markerUnits="userSpaceOnUse" '
-                f'markerWidth="{h:.1f}" markerHeight="{h:.1f}" refX="{h-1:.1f}" '
-                f'refY="{h/2:.1f}" orient="auto">'
-                f'<path d="M0,0 L{h-2:.1f},{h/2:.1f} L0,{h-2:.1f} Z" fill="{BLUE}"/></marker>')
+                f'markerWidth="{length:.1f}" markerHeight="{base:.1f}" '
+                f'refX="{length:.1f}" refY="{base/2:.1f}" orient="auto">'
+                f'<path d="M0,0 L{length:.1f},{base/2:.1f} L0,{base:.1f} Z" '
+                f'fill="{BLUE}"/></marker>')
         defs.append('</defs>')
         o.append("".join(defs))
         o.append(f'<text x="{self.margin}" y="22" fill="{BLUE}" font-size="15" '
@@ -439,10 +655,25 @@ class Diagram:
             o.append(f'<polyline points="{pts}" fill="none" stroke="{BLUE}" '
                      f'stroke-width="{e.weight:.1f}" marker-end="url(#arr{_wkey(e.weight)})"/>')
             if e.label:
-                a, b = e.pts[0], e.pts[-1]
-                lx, ly = (a[0] + b[0]) / 2, min(a[1], b[1]) - 4
+                # Sit the label on the LONGEST HORIZONTAL run of the actual path, above
+                # the wire. Using the midpoint of the first and last point put labels
+                # nowhere near the line once routes grew to five segments, and stacked
+                # them on top of each other where several wires left one box.
+                runs = [(abs(q[0] - r[0]), q, r) for q, r in zip(e.pts, e.pts[1:])
+                        if abs(q[1] - r[1]) < 1]
+                if runs:
+                    _, q, r = max(runs)
+                    lx, ly = (q[0] + r[0]) / 2, q[1] - 5 - e.weight / 2
+                else:
+                    a, b = e.pts[0], e.pts[-1]
+                    lx, ly = (a[0] + b[0]) / 2, min(a[1], b[1]) - 5
+                # A halo, because dark text drawn straight over a dark fat wire is
+                # simply not readable. paint-order puts the stroke behind the fill, so
+                # the glyphs keep their colour and gain a light outline.
                 o.append(f'<text x="{lx:.0f}" y="{ly:.0f}" fill="{GREY}" '
-                         f'font-size="{FS_SMALL}" text-anchor="middle">{_esc(e.label)}</text>')
+                         f'font-size="{FS_SMALL}" text-anchor="middle" '
+                         f'stroke="#ffffff" stroke-width="3" stroke-linejoin="round" '
+                         f'paint-order="stroke">{_esc(e.label)}</text>')
         for bid in self._order:
             o.append(self._box_svg(self.boxes[bid]))
         o.append("</svg>")
