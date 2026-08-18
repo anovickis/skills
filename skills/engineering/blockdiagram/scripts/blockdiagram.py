@@ -46,6 +46,15 @@ LANE = 8           # spacing between parallel runs in a corridor
 # line weight encodes cardinality (THREE tiers only):
 #   signal = one wire (1 px) · bus = a little wider · fat = a fat bus (much wider)
 WEIGHTS = {"signal": 1.0, "bus": 3.0, "fat": 6.0, "wide": 6.0}  # "wide" = alias of fat
+# Wire colour groups what a wire CARRIES, so a reader can pick out the control paths
+# from the data paths without reading a single label. Kept few and kept dark: colour is
+# a grouping cue here, not decoration, and a diagram with nine wire colours has none.
+WIRE_KINDS = {
+    "data": "#1F4E79",         # house blue — payload
+    "control": "#B8860B",      # amber — valid/ready, config, mode
+    "clock": "#6A5ACD",        # slate — clock and reset distribution
+    "interrupt": "#A03030",    # red — interrupts and error reporting
+}
 
 
 # ---- text metrics (measured, with fallback) ------------------------------
@@ -170,12 +179,14 @@ class _Box:
 
 
 class _Edge:
-    def __init__(self, src, dst, label, src_side, dst_side, shape, weight):
+    def __init__(self, src, dst, label, src_side, dst_side, shape, weight, kind="data"):
         self.src, self.src_port = self._split(src)
         self.dst, self.dst_port = self._split(dst)
         self.label = label
         self.src_side, self.dst_side = src_side, dst_side
         self.shape = shape          # "ortho" (default) | "straight" (diagonal ok)
+        self.kind = kind if kind in WIRE_KINDS else "data"
+        self.color = WIRE_KINDS[self.kind]
         # weight = line thickness: "signal" | "bus" | "wide", or a number (px)
         self.weight = WEIGHTS.get(weight, weight) if isinstance(weight, str) else float(weight)
         self.pts = []
@@ -213,8 +224,9 @@ class Diagram:
         return b
 
     def edge(self, src, dst, label=None, src_side=None, dst_side=None,
-             shape="ortho", weight="signal"):
-        self.edges.append(_Edge(src, dst, label, src_side, dst_side, shape, weight))
+             shape="ortho", weight="signal", kind="data"):
+        """`kind` groups wires by what they carry — see WIRE_KINDS."""
+        self.edges.append(_Edge(src, dst, label, src_side, dst_side, shape, weight, kind))
 
     # ---- autoplace (layered, aesthetic-tuned) ----------------------------
     def autoplace(self):
@@ -296,18 +308,6 @@ class Diagram:
                 self.boxes[i].col = col
                 self.boxes[i].row = off + k
         self.ncol, self.nrow = len(chunked), nrow
-
-    def _crossings(self):
-        """Count edge crossings between adjacent columns (lower = cleaner)."""
-        n = 0
-        es = [(self.boxes[e.src], self.boxes[e.dst]) for e in self.edges]
-        for a in range(len(es)):
-            for b in range(a + 1, len(es)):
-                (s1, d1), (s2, d2) = es[a], es[b]
-                if s1.col == s2.col and d1.col == d2.col and s1.col != d1.col:
-                    if (s1.row - s2.row) * (d1.row - d2.row) < 0:
-                        n += 1
-        return n
 
     # ---- layout ----------------------------------------------------------
     def _layout(self):
@@ -457,9 +457,15 @@ class Diagram:
         for idx, (e, s, d, ss, ds) in enumerate(info):
             ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
                          d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")])
+        # Whoever routes first gets the good corridors, so routing ORDER is itself a
+        # lever on crossings. Short hops go first by default (least freedom, most
+        # deserve to be straight); _ripup() promotes a wire that is tangled where it
+        # is, to let it pick a corridor before its rivals do.
+        boost = getattr(self, "_boost", set())
         order = sorted(range(len(info)),
-                       key=lambda i: abs(ends[i][0][0] - ends[i][1][0]) +
-                                     abs(ends[i][0][1] - ends[i][1][1]))
+                       key=lambda i: (0 if i in boost else 1,
+                                      abs(ends[i][0][0] - ends[i][1][0]) +
+                                      abs(ends[i][0][1] - ends[i][1][1])))
         for idx in order:
             e, s, d, ss, ds = info[idx]
             sp, dp = ends[idx]
@@ -543,10 +549,10 @@ class Diagram:
         worse than not running it.
         """
         self._route()
-        best_n, best_hint = self._crossings(), None
+        best_n, best_hint = self._quality(), None
         hint, seen = None, set()
         for _ in range(rounds):                       # barycentre sweep
-            if best_n == 0:
+            if best_n == (0, 0):
                 break
             new = {}
             for idx, e in enumerate(self.edges):
@@ -565,7 +571,7 @@ class Diagram:
                 break
             seen.add(key)
             self._route(hint)
-            n = self._crossings()
+            n = self._quality()
             if n < best_n:
                 best_n, best_hint = n, dict(hint)
 
@@ -575,7 +581,7 @@ class Diagram:
         # adjacent swaps from it.
         cur = dict(best_hint) if best_hint else {}
         for _ in range(3):
-            if not best_n:
+            if best_n == (0, 0):
                 break
             improved = False
             self._route(cur or None)
@@ -588,7 +594,7 @@ class Diagram:
                 for m, v in zip(reversed(order), vals):
                     trial[m] = v
                 self._route(trial)
-                n = self._crossings()
+                n = self._quality()
                 if n < best_n:
                     best_n, best_hint, cur = n, dict(trial), trial
                     improved = True
@@ -598,7 +604,7 @@ class Diagram:
                     a, b = order[i], order[i + 1]
                     trial[a], trial[b] = cur.get(b, i + 1), cur.get(a, i)
                     self._route(trial)
-                    n = self._crossings()
+                    n = self._quality()
                     if n < best_n:
                         best_n, best_hint, cur = n, dict(trial), trial
                         order[i], order[i + 1] = b, a
@@ -607,7 +613,163 @@ class Diagram:
                 break
 
         self._route(best_hint)
+        self._best_hint = best_hint
         return best_n
+
+    # ---- crossing removal: the ladder -----------------------------------
+    #
+    # Crossings are attacked in order of how much they disturb the drawing, cheapest
+    # first. Each rung can fix things the ones below it cannot:
+    #
+    #   1. change the order wires LEAVE a module        \_ _untangle()
+    #   2. change the order wires ENTER a module        /
+    #   3. move the modules themselves                    _move_modules()
+    #   4. route an individual wire differently           _ortho_route() cost function
+    #   5. re-route wires around each other               _ripup()
+    #
+    # Rung 4 is inside the router and always on: among legal paths it takes the one
+    # with fewest crossings. The others are search, and each keeps only moves that
+    # measurably help, so none of them can make a diagram worse.
+
+    def _quality(self):
+        """(hard-rule violations, crossings) — lower is better, violations dominate.
+
+        Crossings are an aesthetic cost; a wire under a block or along another wire is
+        a correctness one. Scoring the ladder on crossings ALONE let a module move buy
+        two fewer crossings at the price of a wire hidden under a box, which is a bad
+        trade and was caught by the self-test rather than by eye.
+        """
+        segs = [sg for e in self.edges for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+        under = sum(1 for sg in segs for b in self.boxes.values() if _seg_in_box(sg, b))
+        along = sum(1 for i, a in enumerate(segs) for b in segs[i + 1:] if _stacked(a, b))
+        return (under + along, self._crossings())
+
+    def _state(self):
+        return ({b.id: (b.col, b.row) for b in self.boxes.values()},
+                dict(getattr(self, "_hint", {}) or {}), set(getattr(self, "_boost", set())))
+
+    def _restore(self, st):
+        cells, hint, boost = st
+        for bid, (c, r) in cells.items():
+            self.boxes[bid].col, self.boxes[bid].row = c, r
+        self._hint, self._boost = dict(hint), set(boost)
+        self._layout(); self._route(self._hint or None)
+
+    def _score(self):
+        self._layout(); self._route(getattr(self, "_hint", None) or None)
+        return self._quality()
+
+    def _move_modules(self, rounds=3):
+        """Rung 3: move the modules, so the wires need not cross at all.
+
+        Some crossings are not a routing problem and not an ordering problem -- they
+        are a placement problem, and no amount of shuffling attachment points or
+        re-routing will remove them. If two blocks are in the wrong rows relative to
+        what they talk to, their wires must cross somewhere. That is why the busiest
+        fan-out sample barely improved from reordering alone: its crossings were
+        decided when the boxes were placed.
+
+        Tries swapping pairs of boxes within a column, then moving a box to a
+        different row, then to a neighbouring column. Keeps a move only if it
+        measurably reduces crossings.
+        """
+        best = self._score()
+        for _ in range(rounds):
+            if best == (0, 0):
+                break
+            improved = False
+            bycol = {}
+            for b in self.boxes.values():
+                bycol.setdefault(b.col, []).append(b)
+            for col, mem in sorted(bycol.items()):
+                mem.sort(key=lambda b: b.row)
+                for i in range(len(mem)):
+                    for j in range(i + 1, len(mem)):
+                        a, c = mem[i], mem[j]
+                        a.row, c.row = c.row, a.row
+                        n = self._score()
+                        if n < best:
+                            best, improved = n, True
+                        else:
+                            a.row, c.row = c.row, a.row
+            # a box in the wrong column costs more than one in the wrong row
+            for b in list(self.boxes.values()):
+                if best == (0, 0):
+                    break
+                c0, r0 = b.col, b.row
+                taken = {(o.col, o.row) for o in self.boxes.values() if o is not b}
+                for c in (c0 - 1, c0 + 1):
+                    if c < 0 or c >= self.ncol:      # stay inside the grid
+                        continue
+                    free = [r for r in range(self.nrow) if (c, r) not in taken]
+                    if not free:
+                        continue
+                    b.col, b.row = c, min(free, key=lambda r: abs(r - r0))
+                    n = self._score()
+                    if n < best:
+                        best, improved = n, True
+                        break
+                    b.col, b.row = c0, r0
+            if not improved:
+                break
+        return best
+
+    def _ripup(self, rounds=2):
+        """Rung 5: let a tangled wire re-route ahead of the ones it fights with.
+
+        Routing is sequential, so the wire that goes first gets the clean corridor and
+        later wires bend around it. When two wires cross, it is often because the one
+        that would have gone straight was routed second. Rip up the wires involved in
+        crossings and give them first pick.
+        """
+        best = self._score()
+        self._boost = set(getattr(self, "_boost", set()))
+        for _ in range(rounds):
+            if best == (0, 0):
+                break
+            improved = False
+            segs = [(sg, i) for i, e in enumerate(self.edges)
+                    for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+            guilty = {}
+            for i, (a, ea) in enumerate(segs):
+                for b, eb in segs[i + 1:]:
+                    if ea != eb and _crosses(a, b):
+                        guilty[ea] = guilty.get(ea, 0) + 1
+                        guilty[eb] = guilty.get(eb, 0) + 1
+            for idx, _ in sorted(guilty.items(), key=lambda kv: -kv[1])[:8]:
+                if idx in self._boost:
+                    continue
+                self._boost.add(idx)
+                n = self._score()
+                if n < best:
+                    best, improved = n, True
+                else:
+                    self._boost.discard(idx)
+            if not improved:
+                break
+        return best
+
+    def _optimise(self):
+        """Walk the ladder, keeping the best arrangement seen at every step."""
+        self._hint, self._boost = None, set()
+        self._layout()
+        n = self._untangle()
+        self._hint = getattr(self, "_best_hint", None)
+        best, state = n, self._state()
+        for step in (self._move_modules, self._untangle_keep, self._ripup):
+            n = step()
+            if n < best:
+                best, state = n, self._state()
+            else:
+                self._restore(state)
+        self._restore(state)
+        return best
+
+    def _untangle_keep(self):
+        """_untangle() again, now that the modules have moved."""
+        n = self._untangle()
+        self._hint = getattr(self, "_best_hint", None)
+        return n
 
     def _vgap_spans(self):
         """Vertical corridors as (lo, hi) RANGES, not centres.
@@ -725,6 +887,15 @@ class Diagram:
             (lx1, ly1), (lx2, ly2) = pts[-2], pts[-1]
             if abs(lx2 - lx1) + abs(ly2 - ly1) < need:
                 return None
+            # A wire must never loop -- it may not cross or double back over ITSELF.
+            # A path that revisits its own ground reads as two wires, and following it
+            # means deciding at the junction which way the signal went. Non-adjacent
+            # segments of one path must therefore stay clear of each other.
+            own = [sg for sg in zip(pts, pts[1:]) if sg[0] != sg[1]]
+            for oi in range(len(own)):
+                for oj in range(oi + 2, len(own)):
+                    if _crosses(own[oi], own[oj]) or _stacked(own[oi], own[oj]):
+                        return None
             return cross, total
 
         best = None
@@ -784,18 +955,19 @@ class Diagram:
 
     @staticmethod
     def _auto_sides(s, d):
-        if d.x >= s.right - 1:
-            return "R", "L"
-        if d.right <= s.x + 1:
-            return "L", "R"
-        if d.y >= s.bottom - 1:
-            return "B", "T"
-        if d.bottom <= s.y + 1:
-            return "T", "B"
-        dx, dy = d.cx - s.cx, d.cy - s.cy
-        if abs(dx) >= abs(dy):
-            return ("R", "L") if dx > 0 else ("L", "R")
-        return ("B", "T") if dy > 0 else ("T", "B")
+        """Outputs leave on the RIGHT, inputs arrive on the LEFT. Always.
+
+        This is the convention every hardware engineer reads a block diagram by, and it
+        holds even when the target sits to the LEFT -- a feedback path leaves the right
+        edge, goes round, and comes back into the left edge. Picking the nearest pair of
+        sides instead produced drawings where a block's outputs emerged from its top,
+        its left and its bottom depending on who happened to be where, so nothing could
+        be told about a block by looking at it.
+
+        Set src_side/dst_side explicitly for a bidirectional link, which may attach to
+        either side.
+        """
+        return "R", "L"
 
     def _anchor(self, b, side):
         return {"L": (b.x, b.cy), "R": (b.right, b.cy),
@@ -803,7 +975,7 @@ class Diagram:
 
     # ---- emit ------------------------------------------------------------
     def _svg(self):
-        self._layout(); self._untangle()
+        self._optimise()
         self._lbl_boxes = []       # label rectangles already placed, so none collide
         # Grow the canvas to whatever the router actually used. Detour corridors can sit
         # outside the box extents -- that is the point of them -- and the width computed
@@ -826,25 +998,40 @@ class Diagram:
         #   PROPORTION. A 6px bus with a 9px head reads as a skinny dart on a fat wire.
         #   The base is now at least 2.6x the stroke, so a heavy wire gets a head that
         #   looks like it belongs to it, while a 1px signal keeps the small tasteful one.
-        weights = sorted({e.weight for e in self.edges})
+        combos = sorted({(e.weight, e.color) for e in self.edges})
         defs = ['<defs>']
-        for w in weights:
+        for w, col in combos:
             base = max(ARROW + 1.4 * w, 2.6 * w)      # across the wire
             length = base * 1.15                      # along it
             defs.append(
-                f'<marker id="arr{_wkey(w)}" markerUnits="userSpaceOnUse" '
+                f'<marker id="arr{_wkey(w)}{_ckey(col)}" markerUnits="userSpaceOnUse" '
                 f'markerWidth="{length:.1f}" markerHeight="{base:.1f}" '
                 f'refX="{length:.1f}" refY="{base/2:.1f}" orient="auto">'
                 f'<path d="M0,0 L{length:.1f},{base/2:.1f} L0,{base:.1f} Z" '
-                f'fill="{BLUE}"/></marker>')
+                f'fill="{col}"/></marker>')
         defs.append('</defs>')
         o.append("".join(defs))
         o.append(f'<text x="{self.margin}" y="22" fill="{BLUE}" font-size="15" '
                  f'font-weight="bold">{_esc(self.title)}</text>')
+        # Legend, only when colour is actually carrying information. A key for one
+        # colour is noise; a diagram with several needs one or the colours are a puzzle.
+        kinds = [k for k in WIRE_KINDS if any(e.kind == k for e in self.edges)]
+        if len(kinds) > 1:
+            lx = self.W - self.margin
+            for k in reversed(kinds):
+                tw = _tw(k, FS_SMALL)
+                lx -= tw
+                o.append(f'<text x="{lx:.0f}" y="22" fill="{GREY}" '
+                         f'font-size="{FS_SMALL}">{k}</text>')
+                lx -= 6
+                o.append(f'<line x1="{lx - 14:.0f}" y1="18" x2="{lx:.0f}" y2="18" '
+                         f'stroke="{WIRE_KINDS[k]}" stroke-width="3"/>')
+                lx -= 22
         for e in self.edges:
             pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in e.pts)
-            o.append(f'<polyline points="{pts}" fill="none" stroke="{BLUE}" '
-                     f'stroke-width="{e.weight:.1f}" marker-end="url(#arr{_wkey(e.weight)})"/>')
+            o.append(f'<polyline points="{pts}" fill="none" stroke="{e.color}" '
+                     f'stroke-width="{e.weight:.1f}" '
+                     f'marker-end="url(#arr{_wkey(e.weight)}{_ckey(e.color)})"/>')
             if e.label:
                 # Label the wire where it can be read. On a long run the two ends can be
                 # most of the diagram apart, and a single mid-wire label means tracing
@@ -1041,7 +1228,7 @@ class Diagram:
             # Must be _untangle, not _route: the SVG is drawn from the untangled
             # arrangement, so linting a plain route would report on geometry that was
             # never actually drawn.
-            self._layout(); self._untangle()
+            self._optimise()
         rep = []
         bs = list(self.boxes.values())
         # box overlap
@@ -1130,6 +1317,10 @@ def _seg_in_box(seg, b):
     m = 1.0
     return (lo_x < b.right - m and hi_x > b.x + m and
             lo_y < b.bottom - m and hi_y > b.y + m)
+
+
+def _ckey(col):
+    return col.replace('#', '')
 
 
 def _seg_len(sg):
@@ -1331,8 +1522,25 @@ def _selftest():
     for i in range(4):                       # deliberately crossed fan-out
         d11.edge("m0", f"m{4 + (3 - i)}", label=f"w{i} [8]")
     d11.autoplace(); d11._layout()
-    d11._route(); before = d11._crossings()
+    d11._route(); before = d11._quality()
     check("untangle never makes crossings worse", d11._untangle() <= before)
+
+    check("crowded: no wire loops back over itself",
+          not any(_crosses(a, b) or _stacked(a, b)
+                  for e in d10.edges
+                  for own in [[sg for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]]
+                  for i, a in enumerate(own) for b in own[i + 2:]))
+    check("flow convention: outputs leave right, inputs arrive left",
+          all(abs(e.pts[0][0] - d10.boxes[e.src].right) < 0.01 and
+              abs(e.pts[-1][0] - d10.boxes[e.dst].x) < 0.01 for e in d10.edges))
+    d12 = Diagram("kinds")
+    d12.node("x", "X"); d12.node("y", "Y")
+    d12.edge("x", "y", label="d [64]", kind="data")
+    d12.edge("x", "y", label="irq [1]", kind="interrupt")
+    svg12 = d12._svg()
+    check("wire kinds get distinct colours + a legend",
+          WIRE_KINDS["interrupt"] in svg12 and WIRE_KINDS["data"] in svg12
+          and svg12.count('y1="18"') == 2)
 
     check("crowded: most wires still carry their name",
           len(lbls) >= int(0.8 * len(d10.edges)))

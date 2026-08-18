@@ -1,5 +1,22 @@
 # Changelog — `blockdiagram` skill
 
+## 0.5.0
+- **The crossing ladder is complete**: reorder exits, reorder entrances, *move the
+  modules* (swap a pair, change a row, change a column), route the wire differently,
+  re-route its neighbours. Module movement was the missing rung and the decisive one —
+  the busiest fan-out sample went 25 → 6 crossings where reordering alone reached 22.
+- **Wires may not loop.** A path that crosses or doubles back over itself reads as two
+  wires; non-adjacent segments of one path must stay clear of each other.
+- **Flow convention**: outputs leave on the right, inputs arrive on the left, always.
+  A feedback path goes round rather than attaching to the nearest side.
+- **Wire colour by kind** (data / control / clock / interrupt), classified from the
+  signal name, with a legend when more than one kind is present.
+- Scoring puts hard-rule violations above crossings, so a module move can never buy
+  two fewer crossings at the price of a wire hidden under a block.
+- Removed a dead `_crossings()` that counted crossings from row order and was silently
+  shadowed by the geometric one.
+- SKILL.md now states the rules explicitly.
+
 ## 0.4.0
 - **Wires enter the arrowhead from behind.** `orient="auto"` already aimed each head
   along its final segment, so the axis was right — but where that segment was shorter

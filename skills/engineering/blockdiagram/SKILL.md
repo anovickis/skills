@@ -22,6 +22,55 @@ routing, no stacked parallel lines, labels that fit inside boxes, small
 arrowheads, and labelled buses. Output SVGs drop straight into a spec's diagrams folder and embed into a
 markdown-to-docx pipeline (native SVG + PNG fallback).
 
+## The rules
+
+What a correct diagram obeys. The engine enforces these; the self-test asserts them.
+
+**Wires**
+1. A wire never passes under a block.
+2. A wire never runs along another wire. Crossing at 90° is fine; travelling together is not.
+3. A wire never loops — it must not cross or double back over itself.
+4. Minimise crossings, but never by breaking 1–3.
+5. Point to point. A wire that merges into another lies about connectivity.
+6. Every wire carries a name **and** a width, in Verilog notation: `d_bits_data [128]`.
+7. Name a long wire at **both** ends, or the reader must trace it back.
+8. A wire enters its arrowhead through the flat back, never through the sloped sides.
+9. Arrowheads scale with the wire and sit on its centreline.
+10. Colour groups wires by what they carry (data / control / clock / interrupt), with a
+    legend whenever more than one kind is present. Unrecognised stays `data` — a wire in
+    the wrong colour is worse than one in the default.
+
+**Blocks**
+11. Inputs arrive on the LEFT, outputs leave on the RIGHT. A feedback path leaves the
+    right edge, goes round, and re-enters the left. Bidirectional links may use either
+    side, set explicitly.
+12. Size a block from the wires entering and leaving it, so there is room to label them.
+13. A block's description is inferred from its wires, never hand-written.
+14. Wrap a wide rank over several columns — an 11-child fan-out in one column leaves the
+    router nowhere to go.
+
+**Labels**
+15. Never on a block, never on another label.
+16. A label must be nearest **its own** wire, or it belongs to neither.
+17. Halo behind the text: dark glyphs on a dark bus are unreadable.
+18. If there is nowhere legible, leave the wire unnamed and let the verifier report it.
+    Never print a name over a block to imply the wire is labelled.
+
+**To remove a crossing** — cheapest disturbance first
+19. Reorder the wires leaving a block.
+20. Reorder the wires entering a block.
+21. Move the blocks: swap a pair, change a row, change a column.
+22. Route that one wire differently.
+23. Re-route its neighbours around it.
+
+**Above all**
+24. Read the finished diagram back and compare it with the source data — every
+    connection, name and width recovered from the drawing itself. If it cannot be
+    recovered, the diagram is wrong however clean it looks.
+25. Lint says the picture is *sound*. The round-trip says it is *true*. Different
+    questions; ask both.
+
+
 ## Use it
 ```python
 import sys; sys.path.insert(0, "<this skill>/scripts")

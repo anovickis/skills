@@ -34,6 +34,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import os
 import sys
 
@@ -195,6 +196,29 @@ def _weight_for(edge, node):
     return "fat" if b >= 256 else "bus" if b >= 32 else "signal"
 
 
+def _kind_for(edge):
+    """Group a wire by what it CARRIES, from the name of its widest signal.
+
+    Colour is a grouping cue, not decoration: with control paths in amber and payload
+    in blue, a reader can pick out the datapath of a design without reading one label.
+    The classification is deliberately coarse, and anything unrecognised stays `data`
+    rather than being guessed into a group -- a wire in the wrong colour is worse than
+    a wire in the default one.
+    """
+    n = str((edge or {}).get("name") or "").lower()
+    if not n:
+        return "data"
+    if "reset" in n or "clock" in n or re.search(r"(^|_)clk(_|$)", n):
+        return "clock"
+    if "int_" in n or n.startswith("int") or "irq" in n or "interrupt" in n:
+        return "interrupt"
+    if any(k in n for k in ("_valid", "_ready", "_opcode", "_param", "_size",
+                            "_source", "_sink", "_mask", "_corrupt", "_denied",
+                            "_error", "_resp")):
+        return "control"
+    return "data"
+
+
 def _edge_label(e, label_edges, ports=False):
     """Name the wire and give its size; a bare relation says nothing.
 
@@ -328,7 +352,8 @@ def main():
     for e in kept_edges:
         d.edge(_safe(e["source"]), _safe(e["target"]),
                label=_edge_label(e, a.label_edges, a.ports),
-               weight=_weight_for(e, nodes.get(e["target"])) if a.ports else "signal")
+               weight=_weight_for(e, nodes.get(e["target"])) if a.ports else "signal",
+               kind=_kind_for(e) if a.ports else "data")
     report = d.save(a.out)
     print(report)
     if a.verify:
