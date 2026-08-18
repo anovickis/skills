@@ -1,5 +1,37 @@
 # Changelog — `blockdiagram` skill
 
+## 0.6.1 — five times faster, same drawings
+A 40-box hierarchy took **229 s**; it now takes **45.8 s**, and the self-test went from
+over two minutes to **5.6 s**. Every one of the eight sample diagrams renders to a
+**byte-identical** SVG, which is how each step was checked: same winner, same picture,
+less work to prove it.
+
+The router's inner clearance test was 95% of the runtime (2.9 million calls, 281 million
+`abs()` on a 21-box diagram). Four changes, none of which alters what gets drawn:
+
+- **Cheap facts before expensive ones, and pruning.** Length, label room, the arrowhead
+  approach and the no-loop rule need nothing but the path itself. Once a clean path is in
+  hand, a longer candidate cannot win whatever it crosses -- so it never reaches the
+  obstacle scan, and with the length known arithmetically it never even reaches the
+  evaluator.
+- **Per-segment memo.** The five-segment candidates are a *product* of tracks, so the
+  same first run recurs a hundred times and the last run ten. Scanning each distinct
+  segment once takes a wire from ~5000 segment scans to ~1200. Sound because a wire is
+  remembered only after its path is chosen, so obstacles do not move mid-call.
+- **Branch pruning on shared segments.** A candidate sharing an illegal segment with a
+  rejected one is itself illegal, so the way out of the source, the way into the target
+  and the drop to the middle band are each tested once and whole branches of the product
+  are dropped.
+- **A box test before the exact ones** in the no-loop check, which was running two exact
+  geometric tests 14 million times a diagram; and obstacles indexed by coordinate band
+  rather than scanned in full.
+
+What was NOT done, with the numbers, since it is a quality decision rather than a
+performance one: the remaining time is ~600 full re-routes by the crossing ladder.
+Capping module movement to one round takes the 40-box tree to 28.5 s for 5 more crossings
+(25 → 30); dropping it entirely gives 23.1 s and 117 crossings. It is left at full
+strength.
+
 ## 0.6.0 — cycles, families, and rails
 Ported from a parallel line of work on the same engine, each change measured against the
 same eight-diagram sample set (77 crossings before, 77 after — see below for what moved

@@ -43,6 +43,7 @@ ARROW = 8
 LABEL_BOTH_ENDS = 300   # a wire longer than this is named at both ends
 WIRE_PITCH = 22     # vertical room reserved per wire attached to a box
 LANE = 8           # spacing between parallel runs in a corridor
+BUCKET = 32        # obstacle index granularity (px) -- see Diagram._route
 # line weight encodes cardinality (THREE tiers only):
 #   signal = one wire (1 px) · bus = a little wider · fat = a fat bus (much wider)
 WEIGHTS = {"signal": 1.0, "bus": 3.0, "fat": 6.0, "wide": 6.0}  # "wide" = alias of fat
@@ -578,8 +579,22 @@ class Diagram:
         # to be straight, and a long wire has the whole canvas to detour through. Doing
         # it in declaration order let an incidental long wire take the gutter a
         # neighbouring pair needed.
+        # Obstacles, INDEXED. The clearance test asks only about things near the segment
+        # being tested, but it used to walk every box and every placed run for every
+        # candidate path -- 2.9 million calls and 281 million abs() on a 21-box diagram,
+        # which was 95% of the runtime. Bucketing by coordinate answers the same question
+        # against a handful of candidates instead of all of them. BUCKET is coarse enough
+        # that a segment need only look at its own bucket and its two neighbours.
         self._used_h, self._used_v = [], []
+        self._uh_by_y, self._uv_by_x = {}, {}
         self._box_rects = [(b.x, b.y, b.right, b.bottom) for b in self.boxes.values()]
+        self._box_by_y, self._box_by_x = {}, {}
+        for r in self._box_rects:
+            bx0, by0, bx1, by1 = r
+            for band in range(int(by0 // BUCKET), int(by1 // BUCKET) + 1):
+                self._box_by_y.setdefault(band, []).append(r)
+            for band in range(int(bx0 // BUCKET), int(bx1 // BUCKET) + 1):
+                self._box_by_x.setdefault(band, []).append(r)
         ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
             dp = d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")]
@@ -983,72 +998,151 @@ class Diagram:
         Checking every segment against every other was the honest version and far too
         slow to run inside the untangle loop.
         """
-        boxes = self._box_rects
-        uh, uv = self._used_h, self._used_v
+        box_by_y, box_by_x = self._box_by_y, self._box_by_x
+        uh_by_y, uv_by_x = self._uh_by_y, self._uv_by_x
+        B = BUCKET
+        # The band loops below are written out rather than wrapped in a helper: this is
+        # the innermost loop of the router, run millions of times per diagram, and even
+        # building one small list per call cost more than the scan it replaced. A run
+        # lives in exactly one band (a horizontal has one y, a vertical one x), so
+        # sweeping a range of bands can never count the same wire twice.
 
-        def ok_and_cost(pts):
+        segc = {}
+
+        def seg_cross(p, q):
+            """Wires this ONE segment crosses, or None if the segment is illegal --
+            passing under a box, or running along another wire.
+
+            Cached per segment, which is the whole trick: the five-segment candidates
+            below are a PRODUCT of tracks (ten by ten by ten), so the first run recurs a
+            hundred times and the last run ten. Scanning each distinct segment once takes
+            a wire from ~5000 segment scans to ~1200. Sound because the obstacle set does
+            not change inside one call -- a wire is remembered only after its path is
+            chosen.
+            """
+            got = segc.get((p, q))
+            if got is not None:
+                return None if got is False else got
+            x1, y1 = p
+            x2, y2 = q
+            if x1 == x2 and y1 == y2:
+                segc[(p, q)] = 0
+                return 0
+            cross = 0
+            if y1 == y2:                                       # horizontal
+                xa, xb = (x1, x2) if x1 < x2 else (x2, x1)
+                by = int(y1 // B)
+                for band in (by - 1, by, by + 1):
+                    for bx0, by0, bx1, by1 in box_by_y.get(band, ()):
+                        if xa < bx1 - 1 and xb > bx0 + 1 and by0 + 1 < y1 < by1 - 1:
+                            segc[(p, q)] = False
+                            return None
+                    for yy, xx0, xx1 in uh_by_y.get(band, ()):
+                        if -3 < yy - y1 < 3 and max(xa, xx0) < min(xb, xx1) - 2:
+                            segc[(p, q)] = False
+                            return None
+                for band in range(int((xa - 1) // B), int((xb + 1) // B) + 1):
+                    for xx, yy0, yy1 in uv_by_x.get(band, ()):
+                        if xa - 1 < xx < xb + 1 and yy0 - 1 < y1 < yy1 + 1:
+                            cross += 1
+            else:                                              # vertical
+                ya, yb = (y1, y2) if y1 < y2 else (y2, y1)
+                bx = int(x1 // B)
+                for band in (bx - 1, bx, bx + 1):
+                    for bx0, by0, bx1, by1 in box_by_x.get(band, ()):
+                        if ya < by1 - 1 and yb > by0 + 1 and bx0 + 1 < x1 < bx1 - 1:
+                            segc[(p, q)] = False
+                            return None
+                    for xx, yy0, yy1 in uv_by_x.get(band, ()):
+                        if -3 < xx - x1 < 3 and max(ya, yy0) < min(yb, yy1) - 2:
+                            segc[(p, q)] = False
+                            return None
+                for band in range(int((ya - 1) // B), int((yb + 1) // B) + 1):
+                    for yy, xx0, xx1 in uh_by_y.get(band, ()):
+                        if ya - 1 < yy < yb + 1 and xx0 - 1 < x1 < xx1 + 1:
+                            cross += 1
+            segc[(p, q)] = cross
+            return cross
+
+        def ok_and_cost(pts, bound=None):
             """(crossings, label-homeless, length) for a legal path, else None.
 
             `label-homeless` is why a wire could end up unnamed. gap_x is sized so a
-            label fits the WHOLE gap between two columns -- but a 3-segment route
-            splits that gap into two half-runs, and a name that fits the gap fits
-            neither half. Rather than double every gap and bloat the drawing, the
-            router prefers, among paths that cross equally little, one that gives its
-            own label somewhere to sit.
+            label fits the WHOLE gap between two columns -- but a 3-segment route splits
+            that gap into two half-runs, and a name that fits the gap fits neither half.
+            Rather than double every gap and bloat the drawing, the router prefers, among
+            paths that cross equally little, one that gives its own label somewhere to sit.
+
+            Cheap facts first: length, label room, the arrowhead approach, the no-loop
+            rule -- none of them need to know about the rest of the diagram. Only then the
+            obstacle scan, and not at all for a path that cannot win: once a clean path is
+            in hand a longer one is beaten whatever it crosses. Same winner, same drawing.
             """
-            cross = 0
             total = 0
             longest_h = 0
             for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
                 if x1 == x2 and y1 == y2:
                     continue
                 total += abs(x2 - x1) + abs(y2 - y1)
-                if y1 == y2:                                   # horizontal
-                    xa, xb = (x1, x2) if x1 < x2 else (x2, x1)
-                    longest_h = max(longest_h, xb - xa)
-                    for bx0, by0, bx1, by1 in boxes:
-                        if xa < bx1 - 1 and xb > bx0 + 1 and by0 + 1 < y1 < by1 - 1:
-                            return None
-                    for yy, xx0, xx1 in uh:
-                        if abs(yy - y1) < 3 and max(xa, xx0) < min(xb, xx1) - 2:
-                            return None
-                    for xx, yy0, yy1 in uv:
-                        if xa - 1 < xx < xb + 1 and yy0 - 1 < y1 < yy1 + 1:
-                            cross += 1
-                else:                                          # vertical
-                    ya, yb = (y1, y2) if y1 < y2 else (y2, y1)
-                    for bx0, by0, bx1, by1 in boxes:
-                        if ya < by1 - 1 and yb > by0 + 1 and bx0 + 1 < x1 < bx1 - 1:
-                            return None
-                    for xx, yy0, yy1 in uv:
-                        if abs(xx - x1) < 3 and max(ya, yy0) < min(yb, yy1) - 2:
-                            return None
-                    for yy, xx0, xx1 in uh:
-                        if ya - 1 < yy < yb + 1 and xx0 - 1 < x1 < xx1 + 1:
-                            cross += 1
-            # The wire must enter its arrowhead through the flat back, not through one
-            # of the slanted sides. orient="auto" already aims the head along the last
-            # segment, so the axis is right -- but if that segment is SHORTER than the
-            # head is long, the corner before it lies inside the triangle and the wire
-            # visibly joins the point from the side.
+                if y1 == y2:
+                    lh = abs(x2 - x1)
+                    if lh > longest_h:
+                        longest_h = lh
+            homeless = 1 if label_w and longest_h < label_w else 0
+            if bound is not None and (0, 0, total) >= bound:
+                return None
+            # The wire must enter its arrowhead through the flat back, not through one of
+            # the slanted sides: orient="auto" aims the head along the last segment, so if
+            # that segment is shorter than the head is long, the corner before it lies
+            # inside the triangle and the wire visibly joins the point from the side.
             (lx1, ly1), (lx2, ly2) = pts[-2], pts[-1]
             if abs(lx2 - lx1) + abs(ly2 - ly1) < need:
                 return None
-            # A wire must never loop -- it may not cross or double back over ITSELF.
-            # A path that revisits its own ground reads as two wires, and following it
-            # means deciding at the junction which way the signal went. Non-adjacent
-            # segments of one path must therefore stay clear of each other.
+            # A wire must never loop. A path that revisits its own ground reads as two
+            # wires, and following it means guessing at the junction which way the signal
+            # went, so non-adjacent segments of one path must stay clear of each other.
             own = [sg for sg in zip(pts, pts[1:]) if sg[0] != sg[1]]
             for oi in range(len(own)):
+                (ax1, ay1), (ax2, ay2) = own[oi]
+                axlo, axhi = (ax1, ax2) if ax1 < ax2 else (ax2, ax1)
+                aylo, ayhi = (ay1, ay2) if ay1 < ay2 else (ay2, ay1)
                 for oj in range(oi + 2, len(own)):
+                    (bx1, by1), (bx2, by2) = own[oj]
+                    # Segments that are nowhere near each other cannot touch, and a box
+                    # test says so in four comparisons -- against two exact tests that
+                    # were being run 14 million times a diagram. The 3 px margin is the
+                    # tolerance the exact tests use, so nothing near enough is skipped.
+                    if (bx1 if bx1 < bx2 else bx2) > axhi + 3:
+                        continue
+                    if (bx1 if bx1 > bx2 else bx2) < axlo - 3:
+                        continue
+                    if (by1 if by1 < by2 else by2) > ayhi + 3:
+                        continue
+                    if (by1 if by1 > by2 else by2) < aylo - 3:
+                        continue
                     if _crosses(own[oi], own[oj]) or _stacked(own[oi], own[oj]):
                         return None
-            return cross, (1 if label_w and longest_h < label_w else 0), total
+            cross = 0
+            for p, q in zip(pts, pts[1:]):
+                c = seg_cross(p, q)
+                if c is None:
+                    return None
+                cross += c
+            return cross, homeless, total
 
         best = None
         vt = self._tracks(self._vgap_spans(), default)
+        # The length of each candidate is arithmetic -- no need to enter the evaluator to
+        # find out that a path is already too long to win.
+        base_len = abs(dp[1] - sp[1])
         for mx in vt[:40]:
-            c = ok_and_cost([sp, (mx, sp[1]), (mx, dp[1]), dp])
+            bound = best[0][0] if best and best[0][0][:2] == (0, 0) else None
+            if bound is not None and \
+                    (0, 0, abs(mx - sp[0]) + base_len + abs(dp[0] - mx)) >= bound:
+                continue
+            if seg_cross(sp, (mx, sp[1])) is None:   # this track cannot be reached at all
+                continue
+            c = ok_and_cost([sp, (mx, sp[1]), (mx, dp[1]), dp], bound)
             if c and (best is None or (c, 2) < best[0]):
                 best = ((c, 2), [sp, (mx, sp[1]), (mx, dp[1]), dp])
                 if c[0] == 0 and c[1] == 0:
@@ -1061,11 +1155,33 @@ class Diagram:
             ht = self._tracks(self._hgap_spans(), (sp[1] + dp[1]) / 2)[:10]
             xt = self._tracks(self._vgap_spans(), dp[0])[:10]
             done = False
+            # A candidate that shares an illegal segment with a rejected one is itself
+            # rejected, so the shared runs are tested ONCE and whole branches of the
+            # product are dropped: the way out of the source (per mx), the way into the
+            # target (per ex), and the drop to the middle band (per mx, my). Same paths
+            # considered, a fraction of the work -- this loop is ten tracks cubed.
             for mx in vt[:10]:
+                l1 = abs(mx - sp[0])
+                if seg_cross(sp, (mx, sp[1])) is None:
+                    continue
                 for ex in xt:
+                    l3, l5 = abs(ex - mx), abs(dp[0] - ex)
+                    if seg_cross((ex, dp[1]), dp) is None:
+                        continue
                     for my in ht:
+                        if seg_cross((mx, sp[1]), (mx, my)) is None:
+                            continue
+                        if seg_cross((ex, my), (ex, dp[1])) is None:
+                            continue
+                        bound = (best[0][0] if best and best[0][0][:2] == (0, 0)
+                                 else None)
+                        # a thousand candidates per wire here (ten tracks cubed), so this
+                        # is where dropping the hopeless ones before the call pays
+                        if bound is not None and (0, 0, l1 + abs(my - sp[1]) + l3
+                                                  + abs(dp[1] - my) + l5) >= bound:
+                            continue
                         pts = [sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp]
-                        c = ok_and_cost(pts)
+                        c = ok_and_cost(pts, bound)
                         if c and (best is None or (c, 4) < best[0]):
                             best = ((c, 4), pts)
                             if c[0] == 0 and c[1] == 0:
@@ -1083,9 +1199,11 @@ class Diagram:
         # exists, and let the lint report it rather than hiding the failure.
         for mx in vt:
             pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
-            if all(not (abs(yy - y) < 3 and max(min(a[0], b[0]), xx0) < min(max(a[0], b[0]), xx1) - 2)
+            if all(not (-3 < yy - y < 3 and max(min(a[0], b[0]), xx0) < min(max(a[0], b[0]), xx1) - 2)
                    for a, b in [(pts[0], pts[1]), (pts[2], pts[3])]
-                   for y in [a[1]] for yy, xx0, xx1 in uh):
+                   for y in [a[1]]
+                   for band in (int(y // B) - 1, int(y // B), int(y // B) + 1)
+                   for yy, xx0, xx1 in uh_by_y.get(band, ())):
                 self._remember(pts)
                 return pts
         pts = [sp, (default, sp[1]), (default, dp[1]), dp]
@@ -1098,9 +1216,13 @@ class Diagram:
             if x1 == x2 and y1 == y2:
                 continue
             if y1 == y2:
-                self._used_h.append((y1, min(x1, x2), max(x1, x2)))
+                run = (y1, min(x1, x2), max(x1, x2))
+                self._used_h.append(run)
+                self._uh_by_y.setdefault(int(y1 // BUCKET), []).append(run)
             else:
-                self._used_v.append((x1, min(y1, y2), max(y1, y2)))
+                run = (x1, min(y1, y2), max(y1, y2))
+                self._used_v.append(run)
+                self._uv_by_x.setdefault(int(x1 // BUCKET), []).append(run)
 
     @staticmethod
     def _auto_sides(s, d):

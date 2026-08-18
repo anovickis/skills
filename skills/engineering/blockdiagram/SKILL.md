@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.6.0
+version: 0.6.1
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -106,6 +106,15 @@ report = d.save("diagrams/foo.svg")                            # writes svg + pn
   block, grey dashed IP), **bus labels** on edges.
 - **Measured text**: boxes size to real font metrics (PIL + Arial-metric font),
   with a heuristic fallback; glyph coverage checked against the actual font.
+
+## Cost
+The router searches: for each wire it considers up to forty three-segment paths and, when
+none is clean, a thousand five-segment ones, and the whole diagram is re-routed for every
+candidate arrangement the crossing ladder tries. That is ~600 full re-routes on a 40-box
+hierarchy. It is *bounded* work, not unbounded, but it is not free: budget a few seconds
+for a dozen boxes and under a minute for forty. If a figure is slow, it is the ladder
+earning its keep — on that 40-box tree, module movement alone takes the crossings from 117
+to 25.
 
 ## Quality gate (always)
 `save()` renders a PNG and runs `lint()`:
