@@ -8,9 +8,11 @@ Design choices (enforced, not re-derived each time):
     heuristic fallback if PIL/font are unavailable.
   * Edge-anchored ORTHOGONAL routing: arrows attach at computed box edges, run
     at right angles through column/row GAP corridors (not through boxes), and
-    parallel runs sharing a corridor are pushed into separate lanes. This is not
-    an autorouter — for awkward cases set src_side/dst_side or add a waypoint;
-    the lint will FAIL if a wire still crosses a third box.
+    parallel runs sharing a corridor are pushed into separate lanes -- ORDERED BY
+    TRAVEL DISTANCE, so a fan-out reads as a comb instead of crossing itself.
+    A wire against the flow is taken around the outside in a reserved channel.
+    This is not an autorouter — for awkward cases set src_side/dst_side (matching
+    sides route around both boxes); the lint FAILs if a wire crosses a third box.
   * Small, proportional arrowheads.
   * Optional ports: declare named connection points on a side and attach edges
     to them ("box:port"); ports are drawn only when declared.
@@ -18,11 +20,14 @@ Design choices (enforced, not re-derived each time):
 
 Quality gate: save() writes the SVG, renders a PNG with inkscape, and runs
 geometric lint (box overlap, text overflow, wire-through-box, stacked parallel
-segments, arrowhead size, glyphs missing from the font). Always eyeball the PNG.
+segments, MEASURED wire crossings, label collisions, arrowhead size, glyphs
+missing from the font). Crossings are counted by intersecting the routed wires,
+not estimated from the grid -- the estimate scored a self-crossing fan-out zero.
+Always eyeball the PNG.
 
 Self-test:  python3 blockdiagram.py --selftest
 """
-import os, subprocess, sys
+import copy, os, subprocess, sys
 
 # ---- house palette / sizes ----------------------------------------------
 BLUE = "#1F4E79"
@@ -38,6 +43,7 @@ FS_PORT = 9
 PAD = 12
 ARROW = 8
 LANE = 8           # spacing between parallel runs in a corridor
+FAN_MIN = 10       # smallest spacing between two wire-ends fanned out on one side
 # line weight encodes cardinality (THREE tiers only):
 #   signal = one wire (1 px) · bus = a little wider · fat = a fat bus (much wider)
 WEIGHTS = {"signal": 1.0, "bus": 3.0, "fat": 6.0, "wide": 6.0}  # "wide" = alias of fat
@@ -123,16 +129,32 @@ class _Box:
         self.ports = {}
         self._port_decl = ports or []
         self.x = self.y = self.w = self.h = 0
+        # how many wire-ends this box must host on its vertical (L/R) and
+        # horizontal (T/B) sides -- a side has to be long enough to fan them
+        # out at readable spacing. Filled in by _layout().
+        self.fan_lr = self.fan_tb = 0
 
-    def need_w(self):
+    def need_w(self, text_only=False):
         widths = [_tw(self.label, FS_LABEL, bold=True)] + [_tw(d, FS_DESC) for d in self.desc]
         if self.title:
             widths.append(_tw(self.title, FS_LABEL, bold=True))
-        return max(widths, default=0) + 2 * PAD
+        text = max(widths, default=0) + 2 * PAD
+        return text if text_only else max(text, self.fan_span(self.fan_tb))
 
-    def need_h(self):
+    def need_h(self, text_only=False):
         n = (1 if self.label else 0) + len(self.desc) + (1 if self.title else 0)
-        return n * (FS_DESC + 6) + 2 * PAD + 6
+        text = n * (FS_DESC + 6) + 2 * PAD + 6
+        return text if text_only else max(text, self.fan_span(self.fan_lr))
+
+    def fan_span(self, k):
+        """Side length needed to fan k wire-ends out at readable spacing.
+
+        The fan places end j at fraction (j+1)/(k+1) of the side, so spacing is
+        side/(k+1). Below FAN_MIN the wires stop reading as separate wires -- the
+        lint's own stacked-lines rule calls anything within 3 px one line -- so a
+        hub with twenty children needs a side tall enough to carry twenty, not a
+        50 px box with the fan crushed into it."""
+        return (k + 1) * FAN_MIN if k > 1 else 0
 
     @property
     def cx(self): return self.x + self.w / 2
@@ -164,6 +186,8 @@ class _Box:
 
 
 class _Edge:
+    lpos = None                      # label position, chosen by Diagram._place_labels
+
     def __init__(self, src, dst, label, src_side, dst_side, shape, weight):
         self.src, self.src_port = self._split(src)
         self.dst, self.dst_port = self._split(dst)
@@ -188,6 +212,7 @@ class Diagram:
         self.boxes = {}
         self.edges = []
         self._order = []
+        self._autoplaced = False
 
     def box(self, bid, col, row, label, desc=None, kind="block",
             colspan=1, rowspan=1, ports=None):
@@ -213,9 +238,11 @@ class Diagram:
     # ---- autoplace (layered, aesthetic-tuned) ----------------------------
     def autoplace(self):
         """Assign (col,row) from connectivity. Layered left-to-right flow with
-        median-barycenter row ordering (few crossings, straightened chains) and
-        vertically-centered columns (balance). A bounded heuristic seed, not a
-        placer/router — override any box's col/row to hand-tune."""
+        median-barycenter row ordering and vertically-centred columns, then two
+        measured passes: try a couple of alternative rankings and keep the one that
+        actually draws better, and swap neighbouring boxes while that keeps helping.
+        A bounded heuristic seed, not a placer/router — override any box's col/row
+        to hand-tune."""
         ids = [b.id for b in self.boxes.values()]
         succ = {i: [] for i in ids}
         pred = {i: [] for i in ids}
@@ -223,11 +250,89 @@ class Diagram:
             if e.src in succ and e.dst in pred and e.src != e.dst:
                 succ[e.src].append(e.dst)
                 pred[e.dst].append(e.src)
-        # 1. rank = longest path from sources (bounded so cycles can't hang)
+        self._back_edges = back = self._find_back_edges(succ)
+
+        # Candidate rankings, cheapest-first, scored on the drawn result. The first is
+        # the plain layering; the others move a "bypassed hub" to the right of the boxes
+        # it feeds. That case is common and reads badly: when a second hub sits in the
+        # middle of a first hub's fan, every wire that skips past it has to share a
+        # corridor with the second hub's own fan, and they cross. Ranked to the right
+        # instead, it fans back leftward and the two combs never meet.
+        cands = [self._rank(ids, succ, pred, back)]
+        for n in self._bypassed_hubs(ids, succ, pred, back):
+            b2 = back | {(n, t) for t in succ[n]}
+            r = self._rank(ids, succ, pred, b2)
+            r[n] = max(r[t] for t in succ[n]) + 1
+            cands.append(r)
+
+        best = None
+        for rank in cands:
+            self._place(rank, succ, pred)
+            sc = self._score()
+            if best is None or sc < best[0]:
+                best = (sc, {i: (b.col, b.row) for i, b in self.boxes.items()},
+                        self.ncol, self.nrow)
+            if sc == (0, 0):
+                break
+        for i, (c, r) in best[1].items():
+            self.boxes[i].col, self.boxes[i].row = c, r
+        self.ncol, self.nrow = best[2], best[3]
+        self._autoplaced = True
+        self._reduce_crossings()
+
+    @staticmethod
+    def _find_back_edges(succ):
+        """Break cycles before ranking. A feedback wire (redirect, stall, retry) is a
+        fact of hardware, and ranking straight through one puts the loop's boxes in the
+        wrong order -- a fetch/decode/exec/wb pipeline with a redirect came out with
+        exec LEFT of fetch, because the longest path ran round the loop. Find the back
+        edges with a depth-first walk, rank on the DAG that is left, and let the back
+        edges be drawn as what they are: wires running against the flow."""
+        back, state = set(), {}                     # state: 0 = on stack, 1 = done
+        for root in succ:
+            if root in state:
+                continue
+            stack = [(root, iter(succ[root]))]
+            state[root] = 0
+            while stack:
+                node, it = stack[-1]
+                for nxt in it:
+                    if state.get(nxt) == 0:         # points back into the current path
+                        back.add((node, nxt))
+                    elif nxt not in state:
+                        state[nxt] = 0
+                        stack.append((nxt, iter(succ[nxt])))
+                        break
+                else:
+                    state[node] = 1
+                    stack.pop()
+        return back
+
+    @staticmethod
+    def _bypassed_hubs(ids, succ, pred, back, limit=3):
+        """Nodes that feed several boxes which are ALSO fed from further left.
+
+        Those are the ones worth trying on the right-hand side of their children: the
+        wires bypassing them are what collide with their own fan. Bounded to the few
+        biggest, so the number of candidate rankings stays small."""
+        out = []
+        for i in ids:
+            kids = [t for t in succ[i] if (i, t) not in back]
+            if len(kids) < 2 or not pred[i]:
+                continue
+            others = sum(1 for k in kids if len([p for p in pred[k] if p != i]) > 0)
+            if others >= 2:
+                out.append((others, len(kids), i))
+        out.sort(reverse=True)
+        return [i for _, _, i in out[:limit]]
+
+    def _rank(self, ids, succ, pred, back):
+        """Longest-path layering over the forward edges, then tighten."""
+        fwd = [e for e in self.edges if (e.src, e.dst) not in back and e.src != e.dst]
         rank = {i: 0 for i in ids}
         for _ in range(len(ids) + 1):
             changed = False
-            for e in self.edges:
+            for e in fwd:
                 if e.src in rank and e.dst in rank and rank[e.dst] < rank[e.src] + 1:
                     rank[e.dst] = rank[e.src] + 1
                     changed = True
@@ -235,23 +340,28 @@ class Diagram:
                 break
         # tighten: pull a pure source (no predecessors) rightward to just before
         # its nearest consumer, so its edges span one rank and don't cross boxes
+        fpred = {i: [p for p in pred[i] if (p, i) not in back] for i in ids}
+        fsucc = {i: [t for t in succ[i] if (i, t) not in back] for i in ids}
         for _ in range(len(ids) + 1):
             moved = False
             for i in ids:
-                if not pred[i] and succ[i]:
-                    r = min(rank[s] for s in succ[i]) - 1
+                if not fpred[i] and fsucc[i]:
+                    r = min(rank[s] for s in fsucc[i]) - 1
                     if r > rank[i]:
                         rank[i] = r
                         moved = True
             if not moved:
                 break
+        return rank
+
+    def _place(self, rank, succ, pred):
+        """Order the rows inside each rank, then assign cells."""
         ranks = {}
-        for i in ids:
+        for i in rank:
             ranks.setdefault(rank[i], []).append(i)
-        maxr = max(rank.values(), default=0)
         pos = {i: float(k) for r in ranks for k, i in enumerate(ranks[r])}
 
-        # 2. ordering sweeps: median barycenter over both neighbour sides
+        # ordering sweeps: median barycenter over both neighbour sides
         def bary(i):
             ns = pred[i] + succ[i]
             if not ns:
@@ -265,7 +375,7 @@ class Diagram:
                 for k, i in enumerate(ranks[r]):
                     pos[i] = float(k)
 
-        # 3. assign cells; centre each column vertically for balance. Columns are
+        # assign cells; centre each column vertically for balance. Columns are
         # re-indexed densely so empty ranks (left by tightening) don't appear.
         nrow = max((len(v) for v in ranks.values()), default=1)
         for col, r in enumerate(sorted(ranks)):
@@ -276,19 +386,209 @@ class Diagram:
                 self.boxes[i].row = off + k
         self.ncol, self.nrow = len(ranks), nrow
 
+    def _clear_skip_bands(self):
+        """Give every column-skipping wire a clear row to travel along.
+
+        An edge whose endpoints are more than one column apart runs horizontally at
+        the destination's row all the way across the columns in between -- straight
+        through whatever sits in that row, which is the lint's "wire crosses box".
+        No routing trick fixes that: the wire needs a row that is empty in the columns
+        it skips, which is a placement question, not a routing one. So move the
+        destination to the nearest such row, adding one row if none exists -- the
+        layered ordering leaves the rest of the placement alone, which is what a
+        Sugiyama dummy node buys you.
+        """
+        def occupied(col, row):
+            for b in self.boxes.values():
+                if (b.col <= col < b.col + b.colspan and
+                        b.row <= row < b.row + b.rowspan):
+                    return b.id
+            return None
+        for e in self.edges:
+            s, d = self.boxes.get(e.src), self.boxes.get(e.dst)
+            if not s or not d or abs(d.col - s.col) < 2:
+                continue
+            between = range(min(s.col, d.col) + 1, max(s.col, d.col))
+
+            def blocked(row):
+                return any(occupied(c, row) for c in between)
+            if not blocked(d.row):
+                continue
+            cands = sorted(range(self.nrow), key=lambda r: (abs(r - d.row), r))
+            for r in cands + [self.nrow]:
+                if occupied(d.col, r) not in (None, d.id) or blocked(r):
+                    continue
+                d.row = r
+                self.nrow = max(self.nrow, r + 1)
+                break
+
     def _crossings(self):
-        """Count edge crossings between adjacent columns (lower = cleaner)."""
-        n = 0
-        es = [(self.boxes[e.src], self.boxes[e.dst]) for e in self.edges]
-        for a in range(len(es)):
-            for b in range(a + 1, len(es)):
-                (s1, d1), (s2, d2) = es[a], es[b]
-                if s1.col == s2.col and d1.col == d2.col and s1.col != d1.col:
-                    if (s1.row - s2.row) * (d1.row - d2.row) < 0:
-                        n += 1
-        return n
+        """Count places where two routed wires actually cross.
+
+        This used to be counted combinatorially -- pairs of edges running between the
+        same two columns whose row order inverts -- which is blind to everything the
+        eye actually sees. It reported ZERO for a twenty-wire fan-out carrying eighty
+        crossings, because a fan out of one box shares a source column and so no pair
+        ever "inverts". Crossings are geometry, so count geometry: intersect the routed
+        polylines. Parallel/collinear overlap is not counted here -- that is the
+        stacked-segments FAIL, a different defect with a different fix."""
+        segs = [(e, (e.pts[k], e.pts[k + 1]))
+                for e in self.edges for k in range(len(e.pts) - 1)]
+        hits = set()
+        for i in range(len(segs)):
+            for j in range(i + 1, len(segs)):
+                (ea, a), (eb, b) = segs[i], segs[j]
+                if ea is eb:
+                    continue
+                x = _cross_point(a, b)
+                if x:
+                    hits.add((id(ea), id(eb), round(x[0], 1), round(x[1], 1)))
+        return len(hits)
+
+    def _geometry_faults(self):
+        """The three geometric FAILs: boxes on boxes, wires through boxes, wires on
+        wires. Split out of lint() because a candidate placement has to be scored on
+        exactly these before the engine will accept it -- see _reduce_crossings."""
+        rep = []
+        bs = list(self.boxes.values())
+        for i in range(len(bs)):
+            for j in range(i + 1, len(bs)):
+                a, b = bs[i], bs[j]
+                if a.x < b.right and b.x < a.right and a.y < b.bottom and b.y < a.bottom:
+                    rep.append(("FAIL", f"box overlap: {a.id} ∩ {b.id}"))
+        # wire through a non-endpoint box (orthogonal edges only; a diagonal
+        # "straight" edge is an explicit author choice and is exempt)
+        for e in self.edges:
+            if e.shape == "straight":
+                continue
+            keep = {e.src, e.dst}
+            for k in range(len(e.pts) - 1):
+                seg = (e.pts[k], e.pts[k + 1])
+                for b in bs:
+                    if b.id in keep:
+                        continue
+                    if _seg_in_box(seg, b):
+                        sb, db = self.boxes[e.src], self.boxes[e.dst]
+                        if sb.col == db.col:      # a bypass down a stack of boxes
+                            how = ("take it around the outside: "
+                                   "src_side=\"R\", dst_side=\"R\" (or both \"L\")")
+                        elif sb.row == db.row:
+                            how = ("take it around the outside: "
+                                   "src_side=\"T\", dst_side=\"T\" (or both \"B\")")
+                        else:
+                            how = (f"place {e.src} and {e.dst} in adjacent cells, or move "
+                                   f"{b.id} out of the corridor between them")
+                        rep.append(("FAIL", f"wire {e.src}->{e.dst} crosses box {b.id} "
+                                    f"— fix: {how}"))
+        # stacked parallel segments (report which edges collide, and how to fix)
+        segs = [((e.pts[k], e.pts[k + 1]), e) for e in self.edges for k in range(len(e.pts) - 1)]
+        for i in range(len(segs)):
+            for j in range(i + 1, len(segs)):
+                ea, eb = segs[i][1], segs[j][1]
+                if ea is eb:
+                    continue
+                if _stacked(segs[i][0], segs[j][0]):
+                    rep.append(("FAIL", f"stacked parallel segments: {ea.src}->{ea.dst} and "
+                                f"{eb.src}->{eb.dst} overlap in one corridor — fix: remove the "
+                                f"duplicate edge, give them distinct src_side/dst_side, or "
+                                f"route one through an intermediate box"))
+        return rep
+
+    def _score(self):
+        """(faults, crossings) for the current placement, measured on a throwaway copy
+        so scoring a candidate cannot leave anything behind in this diagram."""
+        t = copy.deepcopy(self)
+        t._layout(); t._route()
+        return (len(t._geometry_faults()), t._crossings())
+
+    def _reduce_crossings(self, passes=3):
+        """Shuffle blocks: swap neighbours in a column while the picture gets better.
+
+        Barycenter ordering minimises a COMBINATORIAL crossing estimate, which is not
+        what a reader sees -- the wires are routed, and routed wires cross in places the
+        estimate cannot know about. So finish by measuring: try each adjacent pair in
+        each column, keep the swap only if the measured (faults, crossings) actually
+        improves, and stop when a pass changes nothing. Bounded on purpose -- this is a
+        few tens of measured swaps, not a placer."""
+        best = self._score()
+        if best == (0, 0) or len(self.boxes) > 60:
+            return
+        cols = {}
+        for b in self.boxes.values():
+            cols.setdefault(b.col, []).append(b)
+        for _ in range(passes):
+            improved = False
+            for mem in cols.values():
+                mem.sort(key=lambda b: b.row)
+                for i in range(len(mem) - 1):
+                    a, b = mem[i], mem[i + 1]
+                    a.row, b.row = b.row, a.row
+                    sc = self._score()
+                    if sc < best:
+                        best, improved = sc, True
+                        mem[i], mem[i + 1] = b, a
+                    else:
+                        a.row, b.row = b.row, a.row
+            if not improved or best == (0, 0):
+                break
 
     # ---- layout ----------------------------------------------------------
+    def _grid_sizes(self, text_only=False):
+        col_w = [0] * self.ncol
+        row_h = [0] * self.nrow
+        for b in self.boxes.values():
+            if b.colspan == 1:
+                col_w[b.col] = max(col_w[b.col], b.need_w(text_only))
+            if b.rowspan == 1:
+                row_h[b.row] = max(row_h[b.row], b.need_h(text_only))
+        return [max(w, 90) for w in col_w], [max(h, 50) for h in row_h]
+
+    def _grow_spans(self, col_w, row_h):
+        """Let a box with a wide fan span the free cells next to it.
+
+        Growth is symmetric (down, up, down, ...) so the box stays centred on its
+        original cell, and only into cells nothing else claims. A box that cannot
+        grow far enough keeps rowspan==1 and falls back to inflating its row."""
+        claim = {}
+        for b in self.boxes.values():
+            for c in range(b.col, b.col + b.colspan):
+                for r in range(b.row, b.row + b.rowspan):
+                    claim[(c, r)] = b.id
+        for b in sorted(self.boxes.values(), key=lambda b: -b.fan_span(b.fan_lr)):
+            for axis in ("row", "col"):
+                need = b.fan_span(b.fan_lr if axis == "row" else b.fan_tb)
+                sizes = row_h if axis == "row" else col_w
+                gap = self.gap_y if axis == "row" else self.gap_x
+                n = self.nrow if axis == "row" else self.ncol
+                span = "rowspan" if axis == "row" else "colspan"
+                lo = getattr(b, axis)
+                cnt = getattr(b, span)
+                if need <= sum(sizes[lo:lo + cnt]) + (cnt - 1) * gap:
+                    continue
+                cross = range(b.col, b.col + b.colspan) if axis == "row" else \
+                        range(b.row, b.row + b.rowspan)
+
+                def free(i):
+                    if not 0 <= i < n:
+                        return False
+                    return all(claim.get((x, i) if axis == "row" else (i, x)) in (None, b.id)
+                               for x in cross)
+                for direction in (1, -1) * 8:
+                    have = sum(sizes[lo:lo + cnt]) + (cnt - 1) * gap
+                    if need <= have:
+                        break
+                    nxt = lo + cnt if direction > 0 else lo - 1
+                    if not free(nxt):
+                        continue
+                    if direction < 0:
+                        lo = nxt
+                    cnt += 1
+                setattr(b, axis, lo)
+                setattr(b, span, cnt)
+                for x in cross:
+                    for i in range(lo, lo + cnt):
+                        claim[(x, i) if axis == "row" else (i, x)] = b.id
+
     def _layout(self):
         if any(b.col is None for b in self.boxes.values()):
             self.autoplace()
@@ -297,18 +597,58 @@ class Diagram:
         max_lbl = max((_tw(e.label, FS_SMALL) for e in self.edges if e.label), default=0)
         if max_lbl:
             self.gap_x = max(self.gap_x, max_lbl + 16)
-        col_w = [0] * self.ncol
-        row_h = [0] * self.nrow
+        # ...and wide enough for the lanes that have to turn in it. Every edge leaving a
+        # column turns in the corridor on that side, one lane apart; if the corridor is
+        # narrower than the bundle, the outer lanes land BEYOND the destination and the
+        # wire doubles back on itself. Size the corridor to the busiest one.
+        turns = {}
+        for e in self.edges:
+            s_b, d_b = self.boxes.get(e.src), self.boxes.get(e.dst)
+            if s_b and d_b and s_b.col != d_b.col:
+                turns[s_b.col] = turns.get(s_b.col, 0) + 1
+        if turns:
+            self.gap_x = max(self.gap_x, (max(turns.values()) + 1) * LANE + 8)
+        # count each box's wire-ends per axis, so a side can be sized to fan them.
+        # Axis is taken from the grid (different column -> routed L/R, same column
+        # -> T/B), which is known before any geometry exists.
         for b in self.boxes.values():
-            if b.colspan == 1:
-                col_w[b.col] = max(col_w[b.col], b.need_w())
-            if b.rowspan == 1:
-                row_h[b.row] = max(row_h[b.row], b.need_h())
-        col_w = [max(w, 90) for w in col_w]
-        row_h = [max(h, 50) for h in row_h]
+            b.fan_lr = b.fan_tb = 0
+        for e in self.edges:
+            s_b, d_b = self.boxes.get(e.src), self.boxes.get(e.dst)
+            if not s_b or not d_b:
+                continue
+            lr = s_b.col != d_b.col
+            for b, side in ((s_b, e.src_side), (d_b, e.dst_side)):
+                horiz = (side in ("L", "R")) if side else lr
+                if horiz:
+                    b.fan_lr += 1
+                else:
+                    b.fan_tb += 1
+        # Size the grid from text first, then let a box that must host a wide fan
+        # claim the EMPTY cells beside it rather than inflating its whole row: a hub
+        # with twenty children needs 200 px of side, and inflating row 9 to 200 px
+        # would stretch every unrelated box sharing that row to 200 px too.
+        col_w, row_h = self._grid_sizes(text_only=True)
+        self._grow_spans(col_w, row_h)
+        if self._autoplaced:
+            # Only for placements the engine chose. A hand-placed diagram keeps the
+            # author's cells -- if a wire crosses a box there, the lint says so and
+            # names the fix; silently moving someone's box would be worse.
+            self._clear_skip_bands()   # after span growth: a grown box can re-block a band
+        col_w, row_h = self._grid_sizes(text_only=False)
+
+        # Reserve the return channels. A wire taken around the outside runs in a band
+        # beyond the boxes, and if the canvas stops at the last box there is nowhere for
+        # it to go -- the router then has to thread it back through the corridors and it
+        # crosses the very wires it is answering. So make the room first, but only when
+        # something actually needs it.
+        chans = len(getattr(self, "_back_edges", ()) or ())
+        chans += sum(1 for e in self.edges
+                     if e.src_side and e.src_side == e.dst_side)
+        pad = (min(chans, 4) * LANE + self.gap_y) if chans else 0
 
         def cx(c): return self.margin + sum(col_w[:c]) + c * self.gap_x
-        def cy(r): return self.margin + self.title_h + sum(row_h[:r]) + r * self.gap_y
+        def cy(r): return self.margin + self.title_h + pad + sum(row_h[:r]) + r * self.gap_y
 
         for b in self.boxes.values():
             b.x = cx(b.col); b.y = cy(b.row)
@@ -317,7 +657,7 @@ class Diagram:
             b._resolve_ports()
         self._col_w, self._row_h = col_w, row_h
         self.W = cx(self.ncol) - self.gap_x + self.margin
-        self.H = cy(self.nrow) - self.gap_y + self.margin
+        self.H = cy(self.nrow) - self.gap_y + self.margin + pad
 
     def _route(self):
         # pass 1: pick a side for each edge end
@@ -327,9 +667,33 @@ class Diagram:
             ss = e.src_side or (s.ports[e.src_port][0] if e.src_port else None)
             ds = e.dst_side or (d.ports[e.dst_port][0] if e.dst_port else None)
             if ss is None or ds is None:
-                a, b = self._auto_sides(s, d)
+                a, b = self._auto_sides(s, d, e)
                 ss = ss or a; ds = ds or b
             info.append((e, s, d, ss, ds))
+
+        # pass 1b: two wires taken around the outside cannot share a channel bank if
+        # their spans INTERLEAVE (each end inside the other) -- nesting them is
+        # impossible, so whichever goes inside gets cut by the other's leg. One over the
+        # top and one under the bottom, and neither is crossed at all.
+        banks = {"T": [], "B": []}
+        for idx, (e, s, d, ss, ds) in enumerate(info):
+            if ss != ds or ss not in "TB":
+                continue
+            lo, hi = sorted((s.cx, d.cx))
+
+            def interleaves(bank):
+                for a, b in banks[bank]:
+                    nested = (lo <= a and b <= hi) or (a <= lo and hi <= b)
+                    if not (hi <= a or lo >= b or nested):
+                        return True
+                return False
+            for cand in (ss, "B" if ss == "T" else "T"):
+                if self._channel_clear(s, d, cand) and not interleaves(cand):
+                    break
+            else:
+                cand = ss
+            banks[cand].append((lo, hi))
+            info[idx] = (e, s, d, cand, cand)
 
         # pass 2: group edge-ends sharing a (box, side) and FAN them out so they
         # leave at distinct points (a single edge stays centred / aligned).
@@ -343,11 +707,24 @@ class Diagram:
         for (bid, side), mem in groups.items():
             box = self.boxes[bid]
 
-            def other_coord(m):
+            def fan_key(m):
+                """Order the wire-ends along a side so the bundle cannot self-cross.
+
+                Wires ARRIVING at a side may come out of different corridors, and of
+                two arriving from the same direction the one that travelled FARTHEST
+                must take the OUTERMOST end: its long run passes over every nearer
+                wire's turn, so it has to pass beyond them. Wires LEAVING a side all
+                turn in the same corridor (the one next to their own box), so there
+                distance says nothing and plain reading order is right. Ends from
+                opposite directions keep to their own halves of the side."""
                 idx, end = m
                 ob = info[idx][2] if end == "s" else info[idx][1]
-                return ob.cy if side in "LR" else ob.cx
-            mem.sort(key=other_coord)
+                oc, bc = (ob.cy, box.cy) if side in "LR" else (ob.cx, box.cx)
+                dist = 0 if end == "s" else \
+                    abs((ob.col - box.col) if side in "LR" else (ob.row - box.row))
+                before = oc < bc
+                return (0 if before else 1, dist if before else -dist, oc)
+            mem.sort(key=fan_key)
             k = len(mem)
             for j, (idx, end) in enumerate(mem):
                 ob = info[idx][2] if end == "s" else info[idx][1]
@@ -369,34 +746,149 @@ class Diagram:
                         anchor[(idx, end)] = (box.x + f * box.w,
                                               box.y if side == "T" else box.bottom)
 
-        # pass 3: build orthogonal (or straight) point lists
-        corridor = {}
+        # pass 3: build orthogonal (or straight) point lists.
+        #
+        # LANE ORDER IS NOT ARBITRARY.  Every wire leaving a side turns in the gap
+        # corridor, and the order those turns are stacked across the corridor decides
+        # whether the bundle reads as a comb or as a plate of spaghetti.  Handing lanes
+        # out in edge-declaration order self-crosses a fan-out O(n^2) times: a wire that
+        # turns late (outer lane) but travels far cuts across the run-in of every wire
+        # that stopped short.  The crossing-free order is by DESTINATION coordinate --
+        # the farthest target turns first (innermost lane), the nearest turns last --
+        # counted per direction out of each side, since those bundles splay opposite
+        # ways.  Positions are then packed: a lane is reused only for a stretch of the
+        # corridor nothing else runs along, and the two entry sides start half a lane
+        # apart so wires entering one gap from opposite sides cannot land on one line.
+        ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            sp = s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")]
-            dp = d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")]
+            ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
+                         d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")])
+        lane_of = {}
+        for axis, sides in (("v", "LR"), ("h", "TB")):
+            k = 1 if axis == "v" else 0          # coordinate the corridor runs across
+            j = 1 - k                            # coordinate the lanes are spread along
+            buckets = {}
+            for idx, (e, s, d, ss, ds) in enumerate(info):
+                if e.shape == "straight" or ss not in sides or ds not in sides:
+                    continue
+                sp, dp = ends[idx]
+                if abs(sp[k] - dp[k]) < 1:       # already aligned: straight shot, no lane
+                    continue
+                out = 1 if ss in "RB" else -1
+                mid = sp[j] + out * (self.gap_x if axis == "v" else self.gap_y) / 2
+                away = 1 if dp[k] > sp[k] else -1        # down/up (or right/left)
+                buckets.setdefault(round(mid / LANE), {}) \
+                       .setdefault((out, away), []).append((idx, mid))
+            for bundles in buckets.values():     # one corridor's worth of turns
+                n = max(len(m) for m in bundles.values())
+                step = LANE
+                if n > 1:                        # rather than overshoot a tight corridor
+                    room = (self.gap_x if axis == "v" else self.gap_y) / 2 - 4
+                    step = min(LANE, max(2.0, room / n))
+                taken = {}                       # lane x -> stretches already run on it
+                # biggest bundle first, so the main comb gets the inner lanes and the
+                # odd wire against the flow is the one pushed out
+                for (out, away), mem in sorted(bundles.items(), key=lambda kv: -len(kv[1])):
+                    mem.sort(key=lambda m: -away * ends[m[0]][1][k])   # farthest first
+                    for rank_i, (idx, mid) in enumerate(mem):
+                        sp, dp = ends[idx]
+                        lo, hi = sorted((sp[k], dp[k]))
+                        lo, hi = lo - 3, hi + 3  # a hair of daylight between parallel runs
+                        # start half a lane off the corridor centre, on this side: two
+                        # wires entering the same gap from opposite sides would otherwise
+                        # both claim the centre line and be drawn on top of each other
+                        extra = 0
+                        while True:
+                            x = mid + (out * step / 2) + (rank_i + extra) * step * out
+                            if all(hi <= a or lo >= b for a, b in taken.get(round(x, 1), ())):
+                                break
+                            extra += 1
+                        taken.setdefault(round(x, 1), []).append((lo, hi))
+                        lane_of[idx] = x
+
+        # Return channels (both ends leaving the same side) are stacked outside the
+        # boxes, and the wire that reaches FURTHEST must ride the OUTERMOST one. Not the
+        # longest wire -- the one that comes down furthest out: a wire dropping short of
+        # another's far end has to drop on the inside of it, or the two cross. (Length
+        # cannot decide it: two feedback wires a rank apart are almost exactly as long
+        # as each other and still nest one inside the other.)
+        around = {}
+        for side in "TBLR":
+            run = 0 if side in "TB" else 1       # coordinate the channel runs along
+            mem = [i for i, (e, _s, _d, ss, ds) in enumerate(info)
+                   if ss == ds == side]
+
+            def reach(i):
+                """Signed reach: least-reaching wire first, so it lands on the inside."""
+                sp, dp = ends[i]
+                return (1 if dp[run] > sp[run] else -1) * dp[run]
+            mem.sort(key=reach)
+            for r, i in enumerate(mem):
+                around[i] = LANE * r
+
+        for idx, (e, s, d, ss, ds) in enumerate(info):
+            sp, dp = ends[idx]
             if e.shape == "straight":
                 e.pts = [sp, dp]
             elif ss in "LR" and ds in "LR":
-                if abs(sp[1] - dp[1]) < 1:
+                if ss == ds:                      # both leave the same way: go around
+                    off = self.gap_x / 2 + around.get(idx, 0)
+                    midx = (min(sp[0], dp[0]) - off) if ss == "L" else \
+                           (max(sp[0], dp[0]) + off)
+                    e.pts = [sp, (midx, sp[1]), (midx, dp[1]), dp]
+                elif idx not in lane_of:
                     e.pts = [sp, dp]
                 else:
-                    midx = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
-                    bucket = round(midx / LANE)
-                    lane = corridor.get(bucket, 0); corridor[bucket] = lane + 1
-                    midx += lane * LANE * (1 if ss == "R" else -1)
+                    midx = lane_of[idx]
                     e.pts = [sp, (midx, sp[1]), (midx, dp[1]), dp]
             elif ss in "TB" and ds in "TB":
-                if abs(sp[0] - dp[0]) < 1:
+                if ss == ds:
+                    # both ends leave the same way (T/T or B/B): the crossbar has to run
+                    # OUTSIDE both boxes. Averaging the two y values -- which is right
+                    # for a T->B route passing between them -- would drag the wire back
+                    # across the boxes it is meant to go around, which is the whole
+                    # point of asking for the same side (a feedback wire over the top).
+                    off = self.gap_y / 2 + around.get(idx, 0)
+                    midy = (min(sp[1], dp[1]) - off) if ss == "T" else \
+                           (max(sp[1], dp[1]) + off)
+                    e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
+                elif idx not in lane_of:
                     e.pts = [sp, dp]
                 else:
-                    midy = (sp[1] + dp[1]) / 2
+                    midy = lane_of[idx]
                     e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
             else:
                 midy = (sp[1] + dp[1]) / 2
                 e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
 
-    @staticmethod
-    def _auto_sides(s, d):
+    def _channel_clear(self, s, d, side):
+        """Is the return channel just outside these two boxes free of other boxes?"""
+        x0, x1 = min(s.x, d.x), max(s.right, d.right)
+        if side == "T":
+            edge = min(s.y, d.y) - self.gap_y / 2
+            band = (edge - LANE * 2, edge + 1)
+        else:
+            edge = max(s.bottom, d.bottom) + self.gap_y / 2
+            band = (edge - 1, edge + LANE * 2)
+        if band[0] < self.margin / 2 or band[1] > self.H - self.margin / 2:
+            return False
+        for b in self.boxes.values():
+            if b.id in (s.id, d.id):
+                continue
+            if b.x < x1 and x0 < b.right and b.y < band[1] and band[0] < b.bottom:
+                return False
+        return True
+
+    def _auto_sides(self, s, d, e=None):
+        # A wire running against the flow (a feedback path: redirect, stall, retry) is
+        # better taken around the outside than threaded back through the corridors it
+        # came down -- in there it has to cross the forward wires it is answering. Take
+        # the channel above if it is clear, else the one below, else fall through to the
+        # ordinary rules and let the lint report what is left.
+        if e is not None and (e.src, e.dst) in getattr(self, "_back_edges", ()):
+            for side in "TB":
+                if self._channel_clear(s, d, side):
+                    return side, side
         if d.x >= s.right - 1:
             return "R", "L"
         if d.right <= s.x + 1:
@@ -414,9 +906,92 @@ class Diagram:
         return {"L": (b.x, b.cy), "R": (b.right, b.cy),
                 "T": (b.cx, b.y), "B": (b.cx, b.bottom)}[side]
 
+    # ---- labels ----------------------------------------------------------
+    def _place_labels(self):
+        """Put every bus label ON its own wire, and not on top of another label.
+
+        The old rule -- midpoint of (first point, last point), 4 px up -- put the text
+        nowhere near an L-shaped route and stacked a fan-out's labels into one illegible
+        block, because every wire in a fan shares roughly the same midpoint. A label
+        belongs on a straight run of the wire it names, and the run to prefer is the one
+        ARRIVING at the destination: that is where a reader asks "what comes in here",
+        and in a fan those runs are a row apart instead of a lane apart. Candidates are
+        tried widest-label-first (the hardest to fit gets first pick) and the first one
+        that clears the boxes and the labels already placed wins."""
+        placed = []
+        self._label_unplaced = []
+        obstacles = [(b.x, b.y, b.right, b.bottom) for b in self.boxes.values()]
+        for e in self.edges:
+            e.lpos = None
+        for e in sorted((e for e in self.edges if e.label),
+                        key=lambda e: -_tw(e.label, FS_SMALL)):
+            w, h = _tw(e.label, FS_SMALL), FS_SMALL + 2
+            runs = [(a, b) for a, b in zip(e.pts, e.pts[1:])
+                    if abs(a[1] - b[1]) < 1 and abs(a[0] - b[0]) > 2]
+            if not runs:                      # all-vertical route: fall back to the ends
+                a, z = e.pts[0], e.pts[-1]
+                runs = [(a, (z[0], a[1]))]
+            arrival = runs[-1]                # the run that enters the destination
+            runs.sort(key=lambda r: (r is not arrival, -abs(r[0][0] - r[1][0])))
+            cands = []
+            for (x1, y), (x2, _) in runs:
+                lo, hi = sorted((x1, x2))
+                for dy in (-4, h + 4):
+                    # against the far end first: the corridor is already sized to the
+                    # widest label, so a label backed up to the box edge fits in it --
+                    # whereas one CENTRED on a short arrival run spills into the box.
+                    cands.append((hi - 2, y + dy, "end"))
+                    cands.append((lo + 2, y + dy, "start"))
+                    for f in (0.5, 0.35, 0.65):
+                        cands.append((lo + f * (hi - lo), y + dy, "middle"))
+
+            def rect(c):
+                cx, ty, anc = c
+                x0 = cx - w if anc == "end" else (cx if anc == "start" else cx - w / 2)
+                return (x0, ty - h, x0 + w, ty + 2)
+            for c in cands:
+                r = rect(c)
+                if r[0] < self.margin / 2 or r[2] > self.W - self.margin / 2:
+                    continue                  # would run off the canvas
+                if not any(_rect_hit(r, o) for o in placed + obstacles):
+                    e.lpos = c
+                    placed.append(r)
+                    break
+            if e.lpos is None:                # nothing clear: keep the first candidate
+                e.lpos = cands[0]
+                placed.append(rect(cands[0]))
+                self._label_unplaced.append(e)
+
+    def _build(self):
+        """Lay out, route, place labels -- widening the layout until they fit.
+
+        A label that cannot find a clear slot is not a label problem, it is a spacing
+        problem: the corridors and row gaps are too tight for what this diagram has to
+        say. So spread them and try again, a bounded number of times, rather than
+        stacking text on text and leaving the reader to guess. Growth is geometric and
+        capped: a diagram whose labels genuinely cannot coexist still renders, and the
+        lint still says which ones collide."""
+        best = None
+        for _ in range(6):
+            self._layout(); self._route(); self._place_labels()
+            stuck = len(self._label_unplaced)
+            if not stuck:
+                return
+            if best is not None and stuck >= best[0]:
+                # more room did not help: the obstruction is something else (a wire
+                # through a box, a label wider than the whole figure). Go back to the
+                # tightest layout that did this well and let the lint name the real
+                # problem, rather than inflating the canvas for nothing.
+                self.gap_x, self.gap_y = best[1], best[2]
+                self._layout(); self._route(); self._place_labels()
+                return
+            best = (stuck, self.gap_x, self.gap_y)
+            self.gap_x += max(24, int(self.gap_x * 0.2))
+            self.gap_y += 10
+
     # ---- emit ------------------------------------------------------------
     def _svg(self):
-        self._layout(); self._route()
+        self._build()
         o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.W:.0f}" '
              f'height="{self.H:.0f}" viewBox="0 0 {self.W:.0f} {self.H:.0f}" font-family="Arial">']
         # one arrowhead marker per distinct line weight; head scales modestly
@@ -439,10 +1014,13 @@ class Diagram:
             o.append(f'<polyline points="{pts}" fill="none" stroke="{BLUE}" '
                      f'stroke-width="{e.weight:.1f}" marker-end="url(#arr{_wkey(e.weight)})"/>')
             if e.label:
-                a, b = e.pts[0], e.pts[-1]
-                lx, ly = (a[0] + b[0]) / 2, min(a[1], b[1]) - 4
+                lx, ly, anc = e.lpos
+                # painted halo-first, so a label that has to sit over a wire is still
+                # readable instead of being cut in half by it
                 o.append(f'<text x="{lx:.0f}" y="{ly:.0f}" fill="{GREY}" '
-                         f'font-size="{FS_SMALL}" text-anchor="middle">{_esc(e.label)}</text>')
+                         f'font-size="{FS_SMALL}" text-anchor="{anc}" stroke="#ffffff" '
+                         f'stroke-width="3" stroke-linejoin="round" paint-order="stroke">'
+                         f'{_esc(e.label)}</text>')
         for bid in self._order:
             o.append(self._box_svg(self.boxes[bid]))
         o.append("</svg>")
@@ -505,15 +1083,9 @@ class Diagram:
         return report
 
     def lint(self):
-        self._layout(); self._route()
-        rep = []
+        self._build()
+        rep = list(self._geometry_faults())
         bs = list(self.boxes.values())
-        # box overlap
-        for i in range(len(bs)):
-            for j in range(i + 1, len(bs)):
-                a, b = bs[i], bs[j]
-                if a.x < b.right and b.x < a.right and a.y < b.bottom and b.y < a.bottom:
-                    rep.append(("FAIL", f"box overlap: {a.id} ∩ {b.id}"))
         # text overflow (measured)
         for b in bs:
             inner = b.w - 2 * PAD
@@ -523,34 +1095,6 @@ class Diagram:
             for t in b.desc:
                 if _tw(t, FS_DESC) > inner + 0.5:
                     rep.append(("WARN", f"text overflow {b.id!r}: {t!r}"))
-        # wire through a non-endpoint box (orthogonal edges only; a diagonal
-        # "straight" edge is an explicit author choice and is exempt)
-        for e in self.edges:
-            if e.shape == "straight":
-                continue
-            keep = {e.src, e.dst}
-            for k in range(len(e.pts) - 1):
-                seg = (e.pts[k], e.pts[k + 1])
-                for b in bs:
-                    if b.id in keep:
-                        continue
-                    if _seg_in_box(seg, b):
-                        rep.append(("FAIL", f"wire {e.src}->{e.dst} crosses box {b.id} "
-                                    f"— fix: place {e.src} and {e.dst} in adjacent cells, "
-                                    f"or set src_side=/dst_side= to leave via a free side, "
-                                    f"or move {b.id} out of the straight corridor between them"))
-        # stacked parallel segments (report which edges collide, and how to fix)
-        segs = [((e.pts[k], e.pts[k + 1]), e) for e in self.edges for k in range(len(e.pts) - 1)]
-        for i in range(len(segs)):
-            for j in range(i + 1, len(segs)):
-                ea, eb = segs[i][1], segs[j][1]
-                if ea is eb:
-                    continue
-                if _stacked(segs[i][0], segs[j][0]):
-                    rep.append(("FAIL", f"stacked parallel segments: {ea.src}->{ea.dst} and "
-                                f"{eb.src}->{eb.dst} overlap in one corridor — fix: remove the "
-                                f"duplicate edge, give them distinct src_side/dst_side, or "
-                                f"route one through an intermediate box"))
         # glyphs missing from the font
         M = _Metrics.get()
         seen = set()
@@ -565,10 +1109,33 @@ class Diagram:
                 if ch not in seen and M.missing(ch):
                     seen.add(ch)
                     rep.append(("WARN", f"glyph {ch!r} missing from font (edge label)"))
+        # labels that could not be placed clear of a box or another label. Counted,
+        # because an unreadable label is as bad as a wrong wire and the eye is the only
+        # other thing that checks it.
+        rects = {}
+        for e in self.edges:
+            if e.label and e.lpos:
+                w, h = _tw(e.label, FS_SMALL), FS_SMALL + 2
+                cx, ty, anc = e.lpos
+                x0 = cx - w if anc == "end" else (cx if anc == "start" else cx - w / 2)
+                rects[id(e)] = (e, (x0, ty - h, x0 + w, ty + 2))
+        items = list(rects.values())
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                if _rect_hit(items[i][1], items[j][1]):
+                    rep.append(("WARN", f"labels overlap: {items[i][0].label!r} and "
+                                f"{items[j][0].label!r} — shorten one, or drop the "
+                                f"duplicate edge that carries it"))
+        for e, r in items:
+            for b in bs:
+                if _rect_hit(r, (b.x, b.y, b.right, b.bottom)):
+                    rep.append(("WARN", f"label {e.label!r} sits on box {b.id} — "
+                                f"widen the corridor (gap_x) or shorten the label"))
         # aesthetic advisories (not failures)
         nx = self._crossings()
         if nx:
-            rep.append(("WARN", f"{nx} edge crossing(s) — reorder or hand-tune rows"))
+            rep.append(("WARN", f"{nx} wire crossing(s) — reorder rows (swap two boxes in a "
+                                f"column) or split the fan across sides with src_side=/dst_side="))
         ar = self.W / max(self.H, 1)
         if ar > 3.2 or ar < 0.31:
             rep.append(("WARN", f"aspect ratio {ar:.1f}:1 — long/thin; consider "
@@ -582,6 +1149,26 @@ class Diagram:
 
 
 # ---- geometry helpers ----------------------------------------------------
+def _rect_hit(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _cross_point(s1, s2):
+    """Interior intersection of two segments, or None (parallel/touching -> None)."""
+    (p, q), (r, t) = s1, s2
+    d1x, d1y = q[0] - p[0], q[1] - p[1]
+    d2x, d2y = t[0] - r[0], t[1] - r[1]
+    den = d1x * d2y - d1y * d2x
+    if abs(den) < 1e-9:
+        return None
+    a = ((r[0] - p[0]) * d2y - (r[1] - p[1]) * d2x) / den
+    b = ((r[0] - p[0]) * d1y - (r[1] - p[1]) * d1x) / den
+    e = 1e-6
+    if e < a < 1 - e and e < b < 1 - e:
+        return (p[0] + a * d1x, p[1] + a * d1y)
+    return None
+
+
 def _overlap_center(a0, a1, b0, b1):
     lo, hi = max(a0, b0), min(a1, b1)
     return (lo + hi) / 2 if hi - lo > 8 else None
@@ -710,6 +1297,105 @@ def _selftest():
           all(f'stroke-width="{WEIGHTS[w]:.1f}"' in svg for w in ("signal", "bus", "fat")))
     check("weights: arrowhead does not scale with stroke (userSpaceOnUse)",
           'markerUnits="userSpaceOnUse"' in svg)
+
+
+    # ---- crossings, fans, channels, labels (0.3.0) ------------------------------
+    # the crossing count must SEE a crossing: two edges deliberately routed across
+    # each other (the old combinatorial estimate scored this zero)
+    d11 = Diagram("t", cols=2, rows=2)
+    d11.box("a", 0, 0, "A"); d11.box("b", 0, 1, "B")
+    d11.box("c", 1, 0, "C"); d11.box("e", 1, 1, "E")
+    # (straight, so the lane ordering cannot quietly route around it -- the point here
+    # is that the counter SEES geometry; the old estimate scored this zero)
+    d11.edge("a", "e", shape="straight"); d11.edge("b", "c", shape="straight")
+    d11._build()
+    check("crossings: an actual crossing is counted", d11._crossings() >= 1)
+    d11b = Diagram("t", cols=2, rows=2)
+    d11b.box("a", 0, 0, "A"); d11b.box("b", 0, 1, "B")
+    d11b.box("c", 1, 0, "C"); d11b.box("e", 1, 1, "E")
+    d11b.edge("a", "e"); d11b.edge("b", "c")
+    d11b._build()
+    check("crossings: routed lanes avoid the obvious swap", d11b._crossings() == 0)
+
+    # a wide fan-out draws crossing-free, and its source side is sized to host it
+    d12 = Diagram("fan")
+    d12.node("hub", "Hub")
+    for i in range(16):
+        d12.node(f"k{i}", f"Kid{i}")
+        d12.edge("hub", f"k{i}", label=f"bus{i} [64]", weight="bus")
+    rep12 = d12.lint()
+    check("fan-out of 16: no crossings", d12._crossings() == 0)
+    check("fan-out of 16: no FAILs", not any(l == "FAIL" for l, _ in rep12))
+    check("fan-out of 16: source side sized for the fan",
+          d12.boxes["hub"].h >= 16 * FAN_MIN)
+
+    # a wire skipping a column gets a clear row instead of crossing what sits there
+    d13 = Diagram("skip")
+    for i in range(4):
+        d13.node(f"m{i}", f"Mid{i}")
+        d13.edge("src", f"m{i}") if False else None
+    d13.node("src", "Src"); d13.node("far", "Far")
+    for i in range(4):
+        d13.edge("src", f"m{i}")
+    d13.edge("m0", "far"); d13.edge("src", "far")
+    check("column-skipping wire: no FAIL, no crossing",
+          not any(l == "FAIL" for l, _ in d13.lint()) and d13._crossings() == 0)
+
+    # feedback: the loop is not allowed to reverse the flow, and the back wires are
+    # taken around the outside without crossing the forward path
+    d14 = Diagram("pipe")
+    for n in ("f", "d", "x", "w"):
+        d14.node(n, n.upper())
+    d14.edge("f", "d"); d14.edge("d", "x"); d14.edge("x", "w")
+    d14.edge("x", "f", label="redirect [1]"); d14.edge("w", "d", label="stall [1]")
+    rep14 = d14.lint()
+    check("feedback: flow still reads left to right",
+          d14.boxes["f"].col < d14.boxes["d"].col < d14.boxes["x"].col < d14.boxes["w"].col)
+    check("feedback: back wires cross nothing", d14._crossings() == 0)
+    check("feedback: no FAILs", not any(l == "FAIL" for l, _ in rep14))
+
+    # same-side routing goes AROUND both boxes, never back between them
+    d15 = Diagram("t", cols=3, rows=1)
+    d15.box("p", 0, 0, "P"); d15.box("q", 1, 0, "Q"); d15.box("r", 2, 0, "R")
+    d15.edge("r", "p", src_side="T", dst_side="T")
+    d15._build()
+    ys = [y for _, y in d15.edges[0].pts]
+    check("same-side route runs outside the boxes",
+          min(ys) < min(b.y for b in d15.boxes.values()))
+    check("same-side route crosses no box",
+          not any("crosses box" in m for l, m in d15.lint() if l == "FAIL"))
+
+    # labels: on their own wire, clear of boxes and of each other
+    d16 = Diagram("labels")
+    d16.node("s", "S")
+    for i in range(6):
+        d16.node(f"t{i}", f"T{i}")
+        d16.edge("s", f"t{i}", label=f"a_rather_long_signal_name_{i} [128]", weight="bus")
+    rep16 = d16.lint()
+    check("labels: none overlap another label",
+          not any(m.startswith("labels overlap") for l, m in rep16))
+    check("labels: none sit on a box", not any("sits on box" in m for l, m in rep16))
+    check("labels: each sits on its own wire",
+          all(any(abs(y - e.lpos[1]) < FS_SMALL + 8 for _, y in e.pts)
+              for e in d16.edges if e.label))
+
+    # spreading: a tight hand-set gap is widened until the labels fit
+    d17 = Diagram("tight", cols=2, rows=3, gap_x=10, gap_y=4)
+    for r in range(3):
+        d17.box(f"u{r}", 0, r, f"U{r}"); d17.box(f"v{r}", 1, r, f"V{r}")
+        d17.edge(f"u{r}", f"v{r}", label=f"quite_a_long_bus_label_{r} [128]")
+    d17._build()
+    check("spread: corridors widened to fit the labels", d17.gap_x > 10)
+    check("spread: labels all placed", not d17._label_unplaced)
+
+    # a hand-placed diagram is never silently re-placed
+    d18 = Diagram("manual", cols=3, rows=1)
+    d18.box("h", 0, 0, "H"); d18.box("i", 1, 0, "I"); d18.box("j", 2, 0, "J")
+    d18.edge("h", "j")
+    d18._build()
+    check("manual placement is left alone (lint reports instead)",
+          d18.boxes["j"].row == 0 and d18.nrow == 1 and
+          any("crosses box" in m for l, m in d18.lint() if l == "FAIL"))
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

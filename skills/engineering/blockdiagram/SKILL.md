@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.2.0
+version: 0.3.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -59,14 +59,56 @@ report = d.save("diagrams/foo.svg")                            # writes svg + pn
 `save()` renders a PNG and runs `lint()`:
 - `FAIL`: box overlap; orthogonal wire crossing a non-endpoint box; stacked
   (overlapping, non-crossing) parallel segments.
-- `WARN`: text overflows a box (measured); glyph missing from the font (avoid
-  missing-glyph boxes — stick to covered glyphs or convert text to paths).
+- `WARN`: **wire crossings** (counted geometrically, from the routed polylines —
+  see below); a label overlapping another label or sitting on a box; text
+  overflows a box (measured); glyph missing from the font (avoid missing-glyph
+  boxes — stick to covered glyphs or convert text to paths); thin aspect ratio.
+
+**The crossing count is measured, not estimated.** It intersects the routed wires,
+so it reports what a reader sees. (It used to count pairs of edges between the same
+two columns whose row order inverts, which scored a twenty-wire fan-out carrying
+eighty crossings as *zero* — a fan out of one box shares a source column, so no pair
+ever "inverts". If you have an old diagram that lints clean, re-run it.)
 
 Treat any `FAIL` as blocking. After a clean build, **still open the PNG and look**
 — the lint catches geometry, not aesthetics (it will not catch a clipped/overflowing
 label, a title running off the canvas, or a legend sitting on top of a curve; read the
 rendered PNG and confirm every label fits and nothing collides).
 Run the engine self-test with `python3 scripts/blockdiagram.py --selftest`.
+
+## What the engine now gets right on its own
+These were all defects; they are now engine behaviour, so don't hand-fix them:
+- **Lane order in a bundle.** Wires turning in one corridor are ordered by how far
+  they travel — farthest destination innermost — so a fan-out draws as a comb
+  instead of self-crossing. Lanes are also packed per corridor position, so two
+  wires entering the same gap from opposite sides never land on one line.
+- **A side is sized to its fan.** A box that must host *n* wires on one side grows
+  so the ends stay `FAN_MIN` apart, claiming the empty cells beside it (rowspan)
+  rather than inflating its whole grid row.
+- **A column-skipping wire gets a clear row.** Autoplace moves the destination to a
+  row that is empty in the columns the wire skips, adding one row if need be —
+  what a Sugiyama dummy node buys.
+- **Feedback wires read as feedback.** Cycles are broken before ranking (so a
+  pipeline with a `redirect` still reads left→right), and a back edge is taken
+  around the outside, over the top or under the bottom, with the canvas reserving
+  that channel. Two wires whose spans interleave go to opposite banks.
+- **Labels sit on their own wire.** Each label is placed on a straight run of the
+  wire it names (preferring the run arriving at the destination), backed against a
+  box edge so it stays in the corridor, with a white halo so crossing a wire does
+  not cut it in half. If a label cannot be placed clear, the layout **spreads** and
+  retries — and backs off again if spreading is not what was wrong.
+- **Same-side routes go around.** `src_side="T", dst_side="T"` (or both `"B"`,
+  `"L"`, `"R"`) runs the wire outside both boxes. This is the escape hatch the
+  wire-through-box FAIL names, and it is how you route a bypass down a stack.
+
+Two passes are *measured* rather than assumed: autoplace tries a couple of
+alternative rankings (a hub whose children are already fed from the left is tried on
+the right of them) and keeps whichever draws better, then swaps neighbouring boxes
+in a column while that keeps improving the measured (faults, crossings).
+
+**Hand-placed diagrams are never re-placed.** All of the above placement repair
+applies to autoplace only: if you set `col`/`row` yourself, the engine keeps your
+cells and the lint tells you what is wrong and how to fix it.
 
 ## Passing lint the first time (learned failure modes)
 Three FAILs account for almost every failed build. Design the placement to avoid them —
@@ -83,6 +125,9 @@ the FAIL message now names the offending boxes/edges and the fix:
    sibling edges distinct sides; or space the boxes so each gets its own lane.
 3. **Box overlap.** Almost always a `colspan`/`rowspan` collision — no two boxes may claim
    the same cell.
+
+A fourth, rarer one: a **bypass wire down a stack** (same column, skipping boxes)
+cannot be routed inside the column — take it around with `src_side="R", dst_side="R"`.
 
 Iterate placement until `lint: OK`; don't reach for `shape="straight"` to silence a
 crossing — straight edges are *exempt* from the crossing check, so they will silently run

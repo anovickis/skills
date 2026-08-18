@@ -9,6 +9,16 @@ from review feedback on real spec diagrams.
 - **Anchor arrows at computed box edges**, never an eyeballed midpoint. Eyeballing
   caused a real bug where an arrow ended at a box's right edge but only "looked
   right" because the box was drawn over it.
+- **Crossings are counted, and mostly avoidable.** `lint()` intersects the routed
+  wires and WARNs with the number, so "looks about right" is not the test. Most
+  crossings in generated diagrams were never a placement problem at all: they came
+  from handing out corridor lanes in edge-declaration order, which makes a fan-out
+  cross itself O(n²) times. Lanes are now ordered by travel distance. What is left is
+  a design choice — swap two boxes in a column, or split the fan across sides.
+- **A wire against the flow goes around, not back through.** A feedback path routed
+  back through the corridors it came down has to cross the forward wires it answers.
+  Back edges take a reserved channel above or below the boxes; ask for it explicitly
+  with matching `src_side`/`dst_side`.
 - **Crossings are fine; stacked parallel lines are not.** Two parallel segments
   drawn on top of each other read as one line and hide a connection. The engine
   offsets parallel runs sharing a corridor into separate lanes; `lint()` FAILs on
