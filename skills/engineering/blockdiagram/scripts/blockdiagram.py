@@ -357,11 +357,13 @@ class Diagram:
         self.W = cx(self.ncol) - self.gap_x + self.margin
         self.H = cy(self.nrow) - self.gap_y + self.margin
 
-    def _route(self):
+    def _route(self, order_hint=None):
+        """Place every wire. `order_hint` overrides the order wires attach to a box
+        side, which is the lever _untangle() pulls to reduce crossings."""
         self._vgap_cache = None
         self._hgap_cache = None
         # pass 1: pick a side for each edge end
-        info = []
+        info = self._info = []
         for e in self.edges:
             s, d = self.boxes[e.src], self.boxes[e.dst]
             ss = e.src_side or (s.ports[e.src_port][0] if e.src_port else None)
@@ -373,7 +375,7 @@ class Diagram:
 
         # pass 2: group edge-ends sharing a (box, side) and FAN them out so they
         # leave at distinct points (a single edge stays centred / aligned).
-        groups = {}
+        groups = self._groups = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
             if not e.src_port:
                 groups.setdefault((s.id, ss), []).append((idx, "s"))
@@ -387,7 +389,10 @@ class Diagram:
                 idx, end = m
                 ob = info[idx][2] if end == "s" else info[idx][1]
                 return ob.cy if side in "LR" else ob.cx
-            mem.sort(key=other_coord)
+            if order_hint:
+                mem.sort(key=lambda m: order_hint.get(m, other_coord(m)))
+            else:
+                mem.sort(key=other_coord)
             k = len(mem)
             # Where each wire WANTS to leave: level with the box at the other end, so
             # the wire can run straight. Even fractions of the box height gave every
@@ -446,7 +451,8 @@ class Diagram:
         # to be straight, and a long wire has the whole canvas to detour through. Doing
         # it in declaration order let an incidental long wire take the gutter a
         # neighbouring pair needed.
-        self._used = []
+        self._used_h, self._used_v = [], []
+        self._box_rects = [(b.x, b.y, b.right, b.bottom) for b in self.boxes.values()]
         ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
             ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
@@ -473,7 +479,8 @@ class Diagram:
                 else:
                     default = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
                     e.pts = self._ortho_route(sp, dp, default, {s.id, d.id},
-                                              1 if ss == "R" else -1)
+                                              1 if ss == "R" else -1,
+                                              _arrow_len(e.weight) + 2)
                     continue                       # _ortho_route records its own path
             elif (ss in "TB" and ds in "TB" and abs(sp[0] - dp[0]) < 1
                   and not any(_seg_in_box((sp, dp), b) for b in self.boxes.values())):
@@ -508,6 +515,99 @@ class Diagram:
             out.append((lo - before, lo - 6))
             out.append((hi + 6, hi + after))
         return out
+
+    def _crossings(self):
+        """How many times wires cross each other in the current routing."""
+        segs = [(sg, i) for i, e in enumerate(self.edges)
+                for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+        return sum(1 for i, (a, ea) in enumerate(segs)
+                   for b, eb in segs[i + 1:] if ea != eb and _crosses(a, b))
+
+    def _untangle(self, rounds=8):
+        """Reshuffle which wire attaches where, to reduce crossings.
+
+        Routing decides how ONE wire gets across the page. Most crossings are not
+        decided there at all -- they are decided by the ORDER wires attach along a box
+        side, and no amount of clever routing undoes a bad order. Two wires whose
+        attachment points are swapped relative to their destinations must cross
+        somewhere, whatever path each takes.
+
+        So the order is treated as the variable. Each round re-attaches every wire in
+        the order of where its OTHER end actually ended up (rather than where its
+        partner box roughly sits), re-routes, and counts. That is the classical
+        barycentre sweep, and it converges quickly. Adjacent pairs are then swapped one
+        at a time, keeping a swap only when it measurably helps -- which catches the
+        cases the sweep leaves knotted.
+
+        The best arrangement seen is the one kept, so this can never make a diagram
+        worse than not running it.
+        """
+        self._route()
+        best_n, best_hint = self._crossings(), None
+        hint, seen = None, set()
+        for _ in range(rounds):                       # barycentre sweep
+            if best_n == 0:
+                break
+            new = {}
+            for idx, e in enumerate(self.edges):
+                if len(e.pts) < 2:
+                    continue
+                new[(idx, "s")] = e.pts[-1]
+                new[(idx, "d")] = e.pts[0]
+            hint = {}
+            for (bid, side), mem in self._groups.items():
+                for m in mem:
+                    pt = new.get(m)
+                    if pt is not None:
+                        hint[m] = pt[1] if side in "LR" else pt[0]
+            key = tuple(sorted((k, round(v, 1)) for k, v in hint.items()))
+            if key in seen:
+                break
+            seen.add(key)
+            self._route(hint)
+            n = self._crossings()
+            if n < best_n:
+                best_n, best_hint = n, dict(hint)
+
+        # Local improvement. The sweep gets the broad ordering right; these moves fix
+        # the knots it leaves. Reversing a whole side is included because a fan-out
+        # attached in exactly the wrong sense is one move from correct and many
+        # adjacent swaps from it.
+        cur = dict(best_hint) if best_hint else {}
+        for _ in range(3):
+            if not best_n:
+                break
+            improved = False
+            self._route(cur or None)
+            for (bid, side), mem in list(self._groups.items()):
+                if len(mem) < 2:
+                    continue
+                order = list(mem)
+                vals = sorted(cur.get(m, i) for i, m in enumerate(order))
+                trial = dict(cur)
+                for m, v in zip(reversed(order), vals):
+                    trial[m] = v
+                self._route(trial)
+                n = self._crossings()
+                if n < best_n:
+                    best_n, best_hint, cur = n, dict(trial), trial
+                    improved = True
+                    order.reverse()
+                for i in range(len(order) - 1):
+                    trial = dict(cur)
+                    a, b = order[i], order[i + 1]
+                    trial[a], trial[b] = cur.get(b, i + 1), cur.get(a, i)
+                    self._route(trial)
+                    n = self._crossings()
+                    if n < best_n:
+                        best_n, best_hint, cur = n, dict(trial), trial
+                        order[i], order[i + 1] = b, a
+                        improved = True
+            if not improved:
+                break
+
+        self._route(best_hint)
+        return best_n
 
     def _vgap_spans(self):
         """Vertical corridors as (lo, hi) RANGES, not centres.
@@ -562,7 +662,7 @@ class Diagram:
     def _hgaps(self):
         return [(a + b) / 2 for a, b in self._hgap_spans()]
 
-    def _ortho_route(self, sp, dp, default, skip_ids, sign):
+    def _ortho_route(self, sp, dp, default, skip_ids, sign, need=0):
         """An orthogonal path from sp to dp that shares no ground with anything else.
 
         Three hard rules, in order. A path that breaks one is not drawn:
@@ -577,65 +677,84 @@ class Diagram:
         test asked only whether a path hit a BOX. Wires already on the canvas were
         invisible to it, so three buses that all wanted the same gutter all got it and
         were drawn one on top of another -- which is exactly what "the three wide ones
-        merge into one" looks like when the top wire is the widest. Lane offsets did not
-        help because they were applied AFTER the check and never verified, so a lane
-        shift could land a wire straight back on its neighbour.
+        merge into one" looks like when the top wire is the widest.
 
-        Every placed segment is now recorded, and every candidate is tested against the
-        record. Corridors are searched by TRACK rather than by centreline, so a gutter
-        holds as many wires as it has room for, side by side.
+        Placed wires are kept split by orientation, because only a horizontal run can
+        lie along another horizontal run, and only a horizontal can cross a vertical.
+        Checking every segment against every other was the honest version and far too
+        slow to run inside the untangle loop.
         """
-        # EVERY box is an obstacle, including this wire's own two. Excluding them was
-        # meant to let a wire touch the boxes it connects, but a segment that merely
-        # touches an edge is not "in" the box by _seg_in_box's margin anyway -- all the
-        # exclusion actually bought was permission for a wire to be drawn straight
-        # THROUGH its own source, which is what a stub leaving the right edge and
-        # heading left across the block was.
-        obstacles = list(self.boxes.values())
-        used = self._used
+        boxes = self._box_rects
+        uh, uv = self._used_h, self._used_v
 
-        def hits_box(segs):
-            return any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
-
-        def overlaps(segs):
-            return any(_stacked(sg, u) for sg in segs for u in used)
-
-        def crossings(segs):
-            return sum(1 for sg in segs for u in used if _crosses(sg, u))
-
-        def length(pts):
-            return sum(abs(q[0] - r[0]) + abs(q[1] - r[1]) for q, r in zip(pts, pts[1:]))
+        def ok_and_cost(pts):
+            """(crossings, length) for a legal path, or None if it breaks a rule."""
+            cross = 0
+            total = 0
+            for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                if x1 == x2 and y1 == y2:
+                    continue
+                total += abs(x2 - x1) + abs(y2 - y1)
+                if y1 == y2:                                   # horizontal
+                    xa, xb = (x1, x2) if x1 < x2 else (x2, x1)
+                    for bx0, by0, bx1, by1 in boxes:
+                        if xa < bx1 - 1 and xb > bx0 + 1 and by0 + 1 < y1 < by1 - 1:
+                            return None
+                    for yy, xx0, xx1 in uh:
+                        if abs(yy - y1) < 3 and max(xa, xx0) < min(xb, xx1) - 2:
+                            return None
+                    for xx, yy0, yy1 in uv:
+                        if xa - 1 < xx < xb + 1 and yy0 - 1 < y1 < yy1 + 1:
+                            cross += 1
+                else:                                          # vertical
+                    ya, yb = (y1, y2) if y1 < y2 else (y2, y1)
+                    for bx0, by0, bx1, by1 in boxes:
+                        if ya < by1 - 1 and yb > by0 + 1 and bx0 + 1 < x1 < bx1 - 1:
+                            return None
+                    for xx, yy0, yy1 in uv:
+                        if abs(xx - x1) < 3 and max(ya, yy0) < min(yb, yy1) - 2:
+                            return None
+                    for yy, xx0, xx1 in uh:
+                        if ya - 1 < yy < yb + 1 and xx0 - 1 < x1 < xx1 + 1:
+                            cross += 1
+            # The wire must enter its arrowhead through the flat back, not through one
+            # of the slanted sides. orient="auto" already aims the head along the last
+            # segment, so the axis is right -- but if that segment is SHORTER than the
+            # head is long, the corner before it lies inside the triangle and the wire
+            # visibly joins the point from the side.
+            (lx1, ly1), (lx2, ly2) = pts[-2], pts[-1]
+            if abs(lx2 - lx1) + abs(ly2 - ly1) < need:
+                return None
+            return cross, total
 
         best = None
         vt = self._tracks(self._vgap_spans(), default)
-
-        def consider(pts, corners):
-            nonlocal best
-            segs = [sg for sg in zip(pts, pts[1:]) if sg[0] != sg[1]]
-            if hits_box(segs) or overlaps(segs):
-                return False
-            cost = (crossings(segs), round(length(pts)), corners)
-            if best is None or cost < best[0]:
-                best = (cost, pts)
-            return True
-
-        # 1. three segments: out to a vertical track, along it, in to the target.
-        for mx in vt[:60]:
-            consider([sp, (mx, sp[1]), (mx, dp[1]), dp], 2)
-        # A clean 3-segment path with no crossings cannot be beaten; take it at once.
-        if best is not None and best[0][0] == 0:
-            self._remember(best[1])
-            return best[1]
-
-        # 2. five segments: out to a track, along a horizontal band, in. Needed when
-        # the target is several columns away -- the 3-segment form's last run has to
-        # cross the intervening columns at the target's own height, which is precisely
-        # where their boxes are.
-        ht = self._tracks(self._hgap_spans(), (sp[1] + dp[1]) / 2)
-        for mx in vt[:14]:
-            for ex in self._tracks(self._vgap_spans(), dp[0])[:14]:
-                for my in ht[:14]:
-                    consider([sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp], 4)
+        for mx in vt[:40]:
+            c = ok_and_cost([sp, (mx, sp[1]), (mx, dp[1]), dp])
+            if c and (best is None or (c, 2) < best[0]):
+                best = ((c, 2), [sp, (mx, sp[1]), (mx, dp[1]), dp])
+        if best is None or best[0][0][0] > 0:
+            # Five segments: out to a track, along a horizontal band, in. Needed when
+            # the target is several columns away -- the 3-segment form's last run has
+            # to cross the intervening columns at the target's own height, which is
+            # precisely where their boxes are.
+            ht = self._tracks(self._hgap_spans(), (sp[1] + dp[1]) / 2)[:10]
+            xt = self._tracks(self._vgap_spans(), dp[0])[:10]
+            done = False
+            for mx in vt[:10]:
+                for ex in xt:
+                    for my in ht:
+                        pts = [sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp]
+                        c = ok_and_cost(pts)
+                        if c and (best is None or (c, 4) < best[0]):
+                            best = ((c, 4), pts)
+                            if c[0] == 0:
+                                done = True
+                                break
+                    if done:
+                        break
+                if done:
+                    break
         if best is not None:
             self._remember(best[1])
             return best[1]
@@ -644,8 +763,9 @@ class Diagram:
         # exists, and let the lint report it rather than hiding the failure.
         for mx in vt:
             pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
-            segs = list(zip(pts, pts[1:]))
-            if not overlaps(segs):
+            if all(not (abs(yy - y) < 3 and max(min(a[0], b[0]), xx0) < min(max(a[0], b[0]), xx1) - 2)
+                   for a, b in [(pts[0], pts[1]), (pts[2], pts[3])]
+                   for y in [a[1]] for yy, xx0, xx1 in uh):
                 self._remember(pts)
                 return pts
         pts = [sp, (default, sp[1]), (default, dp[1]), dp]
@@ -654,9 +774,13 @@ class Diagram:
 
     def _remember(self, pts):
         """Record a placed path so later wires treat it as an obstacle."""
-        for sg in zip(pts, pts[1:]):
-            if sg[0] != sg[1]:
-                self._used.append(sg)
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            if x1 == x2 and y1 == y2:
+                continue
+            if y1 == y2:
+                self._used_h.append((y1, min(x1, x2), max(x1, x2)))
+            else:
+                self._used_v.append((x1, min(y1, y2), max(y1, y2)))
 
     @staticmethod
     def _auto_sides(s, d):
@@ -679,7 +803,7 @@ class Diagram:
 
     # ---- emit ------------------------------------------------------------
     def _svg(self):
-        self._layout(); self._route()
+        self._layout(); self._untangle()
         self._lbl_boxes = []       # label rectangles already placed, so none collide
         # Grow the canvas to whatever the router actually used. Detour corridors can sit
         # outside the box extents -- that is the point of them -- and the width computed
@@ -914,7 +1038,10 @@ class Diagram:
         constructed geometry -- otherwise the checks quietly become untested.
         """
         if reroute:
-            self._layout(); self._route()
+            # Must be _untangle, not _route: the SVG is drawn from the untangled
+            # arrangement, so linting a plain route would report on geometry that was
+            # never actually drawn.
+            self._layout(); self._untangle()
         rep = []
         bs = list(self.boxes.values())
         # box overlap
@@ -1005,6 +1132,11 @@ def _seg_in_box(seg, b):
             lo_y < b.bottom - m and hi_y > b.y + m)
 
 
+def _seg_len(sg):
+    (x1, y1), (x2, y2) = sg
+    return abs(x2 - x1) + abs(y2 - y1)
+
+
 def _dist_to_pts(pt, pts):
     """Manhattan distance from a point to the nearest point on a polyline."""
     px, py = pt
@@ -1016,6 +1148,11 @@ def _dist_to_pts(pt, pts):
         t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
         best = min(best, abs(px - (x1 + t * dx)) + abs(py - (y1 + t * dy)))
     return best
+
+
+def _arrow_len(w):
+    """How far the arrowhead reaches back along the wire from its tip."""
+    return max(ARROW + 1.4 * w, 2.6 * w) * 1.15
 
 
 def _crosses(s1, s2):
@@ -1185,6 +1322,18 @@ def _selftest():
           not any(lx - _tw(t, FS_SMALL) / 2 < b.right and lx + _tw(t, FS_SMALL) / 2 > b.x
                   and ly - FS_SMALL < b.bottom and ly + 2 > b.y
                   for lx, ly, t in lbls for b in d10.boxes.values()))
+    check("crowded: every wire enters its arrowhead from the flat back",
+          all(_seg_len((e.pts[-2], e.pts[-1])) >= _arrow_len(e.weight)
+              for e in d10.edges))
+    d11 = Diagram("tangle")
+    for i in range(8):
+        d11.node(f"m{i}", f"M{i}")
+    for i in range(4):                       # deliberately crossed fan-out
+        d11.edge("m0", f"m{4 + (3 - i)}", label=f"w{i} [8]")
+    d11.autoplace(); d11._layout()
+    d11._route(); before = d11._crossings()
+    check("untangle never makes crossings worse", d11._untangle() <= before)
+
     check("crowded: most wires still carry their name",
           len(lbls) >= int(0.8 * len(d10.edges)))
 

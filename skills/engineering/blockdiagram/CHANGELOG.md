@@ -1,5 +1,22 @@
 # Changelog — `blockdiagram` skill
 
+## 0.4.0
+- **Wires enter the arrowhead from behind.** `orient="auto"` already aimed each head
+  along its final segment, so the axis was right — but where that segment was shorter
+  than the head is long, the corner before it fell inside the triangle and the wire
+  visibly joined the point from a slanted side. 53 of 85 arrowheads in the sample set
+  were like that. The router now requires a final approach at least as long as the
+  arrowhead; all 85 enter through the flat back.
+- **`_untangle()` reshuffles which wire attaches where**, to reduce crossings: a
+  barycentre sweep followed by whole-side reversal and adjacent-swap improvement,
+  keeping the best arrangement seen. 38% fewer crossings over the sample set
+  (144 → 89). It can never return a worse arrangement than not running it.
+- The router's inner loop keeps placed wires split by orientation, which made
+  untangling (dozens of re-routes per diagram) affordable: 18.1s → 2.1s on a 16-wire
+  case.
+- `lint()` re-routes through `_untangle()`, so it reports on the geometry that is
+  actually drawn rather than a different routing of the same diagram.
+
 ## 0.3.0
 Wires obey three rules, and the drawing is checked against its own source data.
 
