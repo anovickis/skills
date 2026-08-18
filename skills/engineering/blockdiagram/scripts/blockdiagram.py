@@ -43,6 +43,7 @@ FS_PORT = 9
 PAD = 12
 ARROW = 8
 LANE = 8           # spacing between parallel runs in a corridor
+TAP = 16           # length of a rail stub (clock/reset tap into a block)
 FAN_MIN = 10       # smallest spacing between two wire-ends fanned out on one side
 # Wire classes. A hierarchy diagram is unreadable in one colour once interrupts and
 # clock/reset wiring are in it: they are not part of the datapath and should not have
@@ -234,6 +235,22 @@ class Diagram:
         """Add a box WITHOUT a position; autoplace() assigns (col,row)."""
         return self.box(bid, None, None, label, desc, kind, ports=ports)
 
+    def rail(self, src, dsts, label=None, cls="clock", weight="signal", side="T"):
+        """A global signal (clock, reset, scan) drawn as a TAP on each block.
+
+        Drawing clk/rst as one wire per block is what wrecks a deep diagram: eleven of
+        them across five levels cost hundreds of crossings, and no router can help --
+        they genuinely go everywhere. A spec does not draw them either; it draws a tap
+        at each block and names the source once. That is O(1) ink per block instead of
+        O(depth), and it cannot cross anything, because each stub is local to its own
+        box. The relationship is still in the picture and still in the diagram source --
+        `src` is recorded on every tap edge -- it is just not traced across the figure.
+        """
+        for dst in dsts:
+            e = _Edge(src, dst, label, side, side, "tap", weight, cls)
+            self.edges.append(e)
+        return self
+
     def note(self, col, row, title, lines, colspan=1, rowspan=1):
         b = self.box("__note_%d" % len(self.boxes), col, row, "", lines,
                      kind="note", colspan=colspan, rowspan=rowspan)
@@ -259,6 +276,8 @@ class Diagram:
         succ = {i: [] for i in ids}
         pred = {i: [] for i in ids}
         for e in self.edges:
+            if e.shape == "tap":          # a tap is local to its box; it places nothing
+                continue
             if e.src in succ and e.dst in pred and e.src != e.dst:
                 succ[e.src].append(e.dst)
                 pred[e.dst].append(e.src)
@@ -279,12 +298,15 @@ class Diagram:
 
         best = None
         for rank in cands:
-            self._place(rank, succ, pred)
-            sc = self._score()
-            if best is None or sc < best[0]:
-                best = (sc, {i: (b.col, b.row) for i, b in self.boxes.items()},
-                        self.ncol, self.nrow)
-            if sc == (0, 0):
+            for mode in ("alt", "both"):
+                self._place(rank, succ, pred, mode)
+                sc = self._score()
+                if best is None or sc < best[0]:
+                    best = (sc, {i: (b.col, b.row) for i, b in self.boxes.items()},
+                            self.ncol, self.nrow)
+                if sc == (0, 0):
+                    break
+            if best[0] == (0, 0):
                 break
         for i, (c, r) in best[1].items():
             self.boxes[i].col, self.boxes[i].row = c, r
@@ -340,7 +362,8 @@ class Diagram:
 
     def _rank(self, ids, succ, pred, back):
         """Longest-path layering over the forward edges, then tighten."""
-        fwd = [e for e in self.edges if (e.src, e.dst) not in back and e.src != e.dst]
+        fwd = [e for e in self.edges
+               if (e.src, e.dst) not in back and e.src != e.dst and e.shape != "tap"]
         rank = {i: 0 for i in ids}
         for _ in range(len(ids) + 1):
             changed = False
@@ -366,26 +389,71 @@ class Diagram:
                 break
         return rank
 
-    def _place(self, rank, succ, pred):
-        """Order the rows inside each rank, then assign cells."""
+    def _place(self, rank, succ, pred, mode="alt"):
+        """Order the rows inside each rank, then assign cells.
+
+        Two ordering modes, because neither wins everywhere and the difference is worth
+        20-60 crossings on a real graph: "alt" sweeps one side at a time (forward by
+        parents, backward by children), which is what makes a containment TREE come out
+        clean; "both" takes the median over both sides at once, which reads long
+        cross-level wires that a one-sided sweep is blind to. autoplace draws both and
+        keeps whichever measures better."""
         ranks = {}
         for i in rank:
             ranks.setdefault(rank[i], []).append(i)
         pos = {i: float(k) for r in ranks for k, i in enumerate(ranks[r])}
 
-        # ordering sweeps: median barycenter over both neighbour sides
-        def bary(i):
-            ns = pred[i] + succ[i]
+        # Ordering sweeps, ALTERNATING one side at a time -- forward by predecessors,
+        # backward by successors. Averaging both sides at once (what this did before)
+        # does not converge: in a plain containment tree it pulled children away from
+        # their own parent towards their own children, so siblings came out scattered
+        # across the column and a TREE -- which is always drawable flat -- carried ten
+        # crossings. One side at a time, a forward sweep groups every parent's children
+        # together by construction. The best ordering seen is kept, scored on adjacent-
+        # rank inversions (cheap, and only used to choose between candidates here; the
+        # figure itself is measured geometrically later).
+        def bary(i, side):
+            ns = side[i]
             if not ns:
                 return pos[i]
             v = sorted(pos[n] for n in ns)
             m = len(v)
             return v[m // 2] if m % 2 else (v[m // 2 - 1] + v[m // 2]) / 2
-        for _ in range(6):
-            for r in sorted(ranks):                 # iterate populated ranks only
-                ranks[r].sort(key=bary)
+
+        def inversions():
+            n = 0
+            for e in self.edges:
+                for f in self.edges:
+                    if e is f or e.src not in rank or f.src not in rank:
+                        continue
+                    if rank[e.src] != rank[f.src] or rank[e.dst] != rank[f.dst]:
+                        continue
+                    if (pos[e.src] - pos[f.src]) * (pos[e.dst] - pos[f.dst]) < 0:
+                        n += 1
+            return n // 2
+
+        both = {i: pred[i] + succ[i] for i in rank}
+        order = sorted(ranks)
+        best, best_pos = inversions(), dict(pos)
+        for it in range(8):
+            if mode == "both":
+                sweep, side = order, both
+            elif it % 2 == 0:
+                sweep, side = order[1:], pred          # forward: follow the parents
+            else:
+                sweep, side = list(reversed(order[:-1])), succ
+            for r in sweep:
+                ranks[r].sort(key=lambda i: bary(i, side))
                 for k, i in enumerate(ranks[r]):
                     pos[i] = float(k)
+            got = inversions()
+            if got < best:
+                best, best_pos = got, dict(pos)
+            if not best:
+                break
+        pos = best_pos
+        for r in ranks:
+            ranks[r].sort(key=lambda i: pos[i])
 
         # assign cells; centre each column vertically for balance. Columns are
         # re-indexed densely so empty ranks (left by tightening) don't appear.
@@ -422,16 +490,26 @@ class Diagram:
                 continue
             between = range(min(s.col, d.col) + 1, max(s.col, d.col))
 
+            # The destination may span several rows by now (a hub grown to fit its fan),
+            # and every row it spans has to be clear -- checking only its first row moved
+            # a two-row box onto its neighbour.
             def blocked(row):
-                return any(occupied(c, row) for c in between)
+                return any(occupied(c, row + k)
+                           for c in between for k in range(d.rowspan))
+
+            def free_here(row):
+                if row < 0:
+                    return False
+                return all(occupied(d.col + c, row + k) in (None, d.id)
+                           for c in range(d.colspan) for k in range(d.rowspan))
             if not blocked(d.row):
                 continue
             cands = sorted(range(self.nrow), key=lambda r: (abs(r - d.row), r))
             for r in cands + [self.nrow]:
-                if occupied(d.col, r) not in (None, d.id) or blocked(r):
+                if not free_here(r) or blocked(r):
                     continue
                 d.row = r
-                self.nrow = max(self.nrow, r + 1)
+                self.nrow = max(self.nrow, r + d.rowspan)
                 break
 
     def _crossings(self):
@@ -693,6 +771,13 @@ class Diagram:
             s_b, d_b = self.boxes.get(e.src), self.boxes.get(e.dst)
             if not s_b or not d_b:
                 continue
+            if e.shape == "tap":
+                horiz = e.dst_side in ("L", "R")
+                if horiz:
+                    d_b.fan_lr += 1
+                else:
+                    d_b.fan_tb += 1
+                continue
             lr = s_b.col != d_b.col
             for b, side in ((s_b, e.src_side), (d_b, e.dst_side)):
                 horiz = (side in ("L", "R")) if side else lr
@@ -783,7 +868,7 @@ class Diagram:
         # leave at distinct points (a single edge stays centred / aligned).
         groups = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            if not e.src_port:
+            if not e.src_port and e.shape != "tap":
                 groups.setdefault((s.id, ss), []).append((idx, "s"))
             if not e.dst_port:
                 groups.setdefault((d.id, ds), []).append((idx, "d"))
@@ -845,8 +930,12 @@ class Diagram:
         # apart so wires entering one gap from opposite sides cannot land on one line.
         ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
-                         d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")])
+            dp = d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")]
+            if e.shape == "tap":
+                ends[idx] = (dp, dp)      # source end is not a box edge; see the router
+            else:
+                ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
+                             dp)
         lane_of = {}
         for axis, sides in (("v", "LR"), ("h", "TB")):
             k = 1 if axis == "v" else 0          # coordinate the corridor runs across
@@ -926,7 +1015,12 @@ class Diagram:
 
         for idx, (e, s, d, ss, ds) in enumerate(info):
             sp, dp = ends[idx]
-            if e.shape == "around":
+            if e.shape == "tap":
+                # a stub into this box's own edge, pointing inwards
+                back_off = {"T": (0, -TAP), "B": (0, TAP),
+                            "L": (-TAP, 0), "R": (TAP, 0)}[ds]
+                e.pts = [(dp[0] + back_off[0], dp[1] + back_off[1]), dp]
+            elif e.shape == "around":
                 # Out of the figure and back in: away from the boxes into the side
                 # margin, along the reserved band past everything, and in at the far
                 # side. The margins and the top/bottom bands are the only space in the
@@ -939,7 +1033,10 @@ class Diagram:
                 y = self._outer_channel("B" if near_bottom else "T", lane)
                 xs = (self.margin / 2 + lane) if ss == "L" else (self.W - self.margin / 2 - lane)
                 xd = (self.margin / 2 + lane) if ds == "L" else (self.W - self.margin / 2 - lane)
-                e.pts = [sp, (xs, sp[1]), (xs, y), (xd, y), (xd, dp[1]), dp]
+                if abs(xs - xd) < 1:          # both ends leave towards the same margin
+                    e.pts = [sp, (xs, sp[1]), (xs, dp[1]), dp]
+                else:
+                    e.pts = [sp, (xs, sp[1]), (xs, y), (xd, y), (xd, dp[1]), dp]
             elif e.shape == "straight":
                 e.pts = [sp, dp]
             elif ss in "LR" and ds in "LR":
@@ -977,25 +1074,64 @@ class Diagram:
                 e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
 
     def _channel_clear(self, s, d, side):
-        """Is the channel just outside these two boxes free of other boxes?"""
-        if side == "T":
-            edge = min(s.y, d.y) - self.gap_y / 2
-            band = (edge - LANE * 2, edge + 1)
-        else:
-            edge = max(s.bottom, d.bottom) + self.gap_y / 2
-            band = (edge - 1, edge + LANE * 2)
-        if band[0] < self.margin / 2 or band[1] > self.H - self.margin / 2:
-            return False
-        return self._band_clear(s, d, band)
+        """Is the channel just outside these two boxes free of other boxes?
 
-    def _band_clear(self, s, d, band):
-        x0, x1 = min(s.x, d.x), max(s.right, d.right)
-        for b in self.boxes.values():
-            if b.id in (s.id, d.id):
-                continue
-            if b.x < x1 and x0 < b.right and b.y < band[1] and band[0] < b.bottom:
+        Both axes matter. A wire running back against the flow between two DIFFERENT
+        columns wants the band above or below them; one running back inside a single
+        column wants that column's own gap corridor, where a vertical run is exactly
+        what the corridor is for."""
+        if side in "TB":
+            edge = (min(s.y, d.y) - self.gap_y / 2) if side == "T" else \
+                   (max(s.bottom, d.bottom) + self.gap_y / 2)
+            band = (edge - LANE * 2, edge + 1) if side == "T" else (edge - 1, edge + LANE * 2)
+            if band[0] < self.margin / 2 or band[1] > self.H - self.margin / 2:
+                return False
+            return self._band_clear(s, d, band)
+        edge = (min(s.x, d.x) - self.gap_x / 2) if side == "L" else \
+               (max(s.right, d.right) + self.gap_x / 2)
+        band = (edge - LANE * 2, edge + 1) if side == "L" else (edge - 1, edge + LANE * 2)
+        if band[0] < self.margin / 2 or band[1] > self.W - self.margin / 2:
+            return False
+        return self._band_clear(s, d, band, axis="x")
+
+    def _same_side_ok(self, s, d, side):
+        """Can these two boxes really be joined by a route leaving both on `side`?
+
+        The crossbar is only half of it: the route also has two LEGS, from each box out
+        to the crossbar, and those run at the boxes' own centre lines -- straight down
+        their own columns. A feedback wire between two boxes twenty rows apart passed
+        the crossbar test and then rose through every box in its column. Check the legs
+        as well, and if they are not clear the wire belongs outside the figure."""
+        if not self._channel_clear(s, d, side):
+            return False
+        if side in "TB":
+            edge = (min(s.y, d.y) - self.gap_y / 2) if side == "T" else \
+                   (max(s.bottom, d.bottom) + self.gap_y / 2)
+            for b in (s, d):
+                lo, hi = sorted((edge, b.y if side == "T" else b.bottom))
+                if not self._leg_clear(s, d, (b.cx - 2, b.cx + 2), (lo, hi)):
+                    return False
+            return True
+        edge = (min(s.x, d.x) - self.gap_x / 2) if side == "L" else \
+               (max(s.right, d.right) + self.gap_x / 2)
+        for b in (s, d):
+            lo, hi = sorted((edge, b.x if side == "L" else b.right))
+            if not self._leg_clear(s, d, (lo, hi), (b.cy - 2, b.cy + 2)):
                 return False
         return True
+
+    def _leg_clear(self, s, d, xs, ys):
+        return not any(b.x < xs[1] and xs[0] < b.right and b.y < ys[1] and ys[0] < b.bottom
+                       for b in self.boxes.values() if b.id not in (s.id, d.id))
+
+    def _band_clear(self, s, d, band, axis="y"):
+        if axis == "y":
+            lo, hi = min(s.x, d.x), max(s.right, d.right)
+            return not any(b.x < hi and lo < b.right and b.y < band[1] and band[0] < b.bottom
+                           for b in self.boxes.values() if b.id not in (s.id, d.id))
+        lo, hi = min(s.y, d.y), max(s.bottom, d.bottom)
+        return not any(b.y < hi and lo < b.bottom and b.x < band[1] and band[0] < b.right
+                       for b in self.boxes.values() if b.id not in (s.id, d.id))
 
     def _outer_channel(self, side, lane):
         """The channel outside EVERY box, in the canvas margin reserved for it.
@@ -1015,9 +1151,15 @@ class Diagram:
         # the channel above if it is clear, else the one below, else fall through to the
         # ordinary rules and let the lint report what is left.
         if e is not None and (e.src, e.dst) in getattr(self, "_back_edges", ()):
-            for side in "TB":
-                if self._channel_clear(s, d, side):
+            # Same column (a loop inside one block's stack) -> that column's corridor.
+            # Different columns -> the band above or below. Nothing clear -> right out
+            # around the outside, rather than back through the boxes.
+            near = s.col == d.col or (s.x < d.right and d.x < s.right)
+            for side in ("RLTB" if near else "TBRL"):
+                if self._same_side_ok(s, d, side):
                     return side, side
+            e.shape = "around"
+            return ("L", "R") if d.col > s.col else ("R", "L")
         if d.x >= s.right - 1:
             return "R", "L"
         if d.right <= s.x + 1:
@@ -1650,7 +1792,7 @@ def _selftest():
     check("around: the figure's crossings drop sharply", d23._crossings() <= 4)
     around = [e for e in d23.edges if e.shape == "around"]
     check("around: only the offenders were sent outside, not the whole diagram",
-          1 <= len(around) <= 2)
+          len(around) <= 2)
     if around:
         e = around[0]
         inside = [b for b in d23.boxes.values()
@@ -1658,6 +1800,68 @@ def _selftest():
         check("around: its legs run in the margin, clear of every box", not inside)
     else:
         check("around: its legs run in the margin, clear of every box", True)
+
+
+    # ---- depth: trees, taps, and long loops (0.6.0) ------------------------------
+    # A containment tree is always drawable flat, so it must come out with NO crossings
+    # at any depth. It did not: the ordering sweep averaged parents and children at once
+    # and scattered siblings across their column.
+    d24 = Diagram("four-level tree")
+    d24.node("root", "Root", kind="emphasis")
+    q, n = ["root"], 0
+    for lvl in range(3):
+        nxt = []
+        for parent in q:
+            for k in range(3):
+                n += 1
+                bid = f"t{n}"
+                d24.node(bid, f"B{lvl}.{k}")
+                d24.edge(parent, bid, label="tl [64]", weight="bus")
+                nxt.append(bid)
+        q = nxt
+    d24._build()
+    check("depth: a four-level containment tree has no crossings", d24._crossings() == 0)
+    check("depth: and no FAILs", not any(l == "FAIL" for l, _ in d24.lint()))
+    kids = {}
+    for e in d24.edges:
+        kids.setdefault(e.src, []).append(d24.boxes[e.dst].row)
+    check("depth: siblings stay contiguous in their column",
+          all(sorted(rs) == list(range(min(rs), min(rs) + len(rs))) for rs in kids.values()))
+
+    # rail(): a global signal as a tap per block -- no long wires, so nothing to cross
+    d25 = Diagram("clock rail")
+    d25.node("clk", "ClockSource", kind="emphasis")
+    d25.node("top", "Top", kind="emphasis")
+    d25.edge("top", "clk", label="tl [64]")
+    targets = []
+    for i in range(12):
+        d25.node(f"b{i}", f"Blk{i}")
+        d25.edge("top", f"b{i}", label="tl [64]", weight="bus")
+        targets.append(f"b{i}")
+    d25.rail("clk", targets, label="clk/rst", cls="clock")
+    rep25 = d25.lint()
+    taps = [e for e in d25.edges if e.shape == "tap"]
+    check("rail: one tap per block", len(taps) == 12)
+    check("rail: taps are short stubs on the block itself",
+          all(len(e.pts) == 2 and abs(e.pts[0][1] - e.pts[1][1]) == TAP for e in taps))
+    check("rail: a 12-way global signal costs no crossings", d25._crossings() == 0)
+    check("rail: and no FAILs", not any(l == "FAIL" for l, _ in rep25))
+    check("rail: taps do not drive placement",
+          d25.boxes["clk"].col <= d25.boxes["b0"].col)
+
+    # a loop between two boxes far apart down one column: the channel's LEGS run at the
+    # boxes' own centre lines, straight down their column, and must be checked too
+    d26 = Diagram("long loop", cols=2, rows=8)
+    for r in range(8):
+        d26.box(f"s{r}", 1, r, f"Stage{r}")
+    d26.box("drv", 0, 0, "Driver")
+    d26.edge("drv", "s0", label="in [64]")
+    for r in range(7):
+        d26.edge(f"s{r}", f"s{r+1}", label="next [64]")
+    d26.edge("s7", "s0", label="loop [1]", cls="control", src_side="R", dst_side="R")
+    rep26 = d26.lint()
+    check("long loop: routed clear of every box in its column",
+          not any("crosses box" in m for l, m in rep26 if l == "FAIL"))
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

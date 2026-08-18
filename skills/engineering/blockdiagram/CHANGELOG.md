@@ -1,5 +1,32 @@
 # Changelog — `blockdiagram` skill
 
+## 0.6.0 — depth
+Tested by connecting five levels of hierarchy and sweeping the two variables apart:
+containment depth, and cross-level dataflow added on top.
+
+- **A containment tree now draws with zero crossings at any depth** (was 10 at depth 3+).
+  The ordering sweep took the median over parents AND children at once, which does not
+  converge -- children were pulled towards their own children and siblings ended up
+  scattered across their column. Sweeps are now one-sided and alternating (forward by
+  parents, backward by children), which groups every parent's children by construction.
+  Both orderings are drawn and the better-measuring one kept, since the two-sided median
+  still wins where long cross-level wires dominate.
+- **`rail(src, dsts, ...)`**: a global signal as a tap per block instead of one wire per
+  block. Clock/reset across five levels cost hundreds of crossings as wires; as taps it
+  costs none, which is also how a spec draws it. Taps take no part in ranking or
+  placement, and each is a short stub on its own box.
+- **A channel's LEGS are checked, not just its crossbar.** A feedback wire between two
+  boxes twenty rows apart passed the crossbar test and then rose at its own column's
+  centre line through every box in it. With the legs checked, such a wire is sent around
+  the outside instead -- this cleared 53 wire-through-box FAILs in the five-level figure.
+- **Band clearance is rowspan-aware.** It moved a two-row hub onto its neighbour by
+  testing only the box's first row (a real box-overlap FAIL, the worst kind).
+
+Measured: 5-level containment 46 boxes / 45 wires -> 0 crossings, 0 FAILs. The same
+figure with 27 cross-level wires -> 218 crossings, 0 FAILs; that is the honest limit of
+a flat layered grid, and the reason `rail()` and per-relation figures exist. Corpus of
+eight, stress suite and the 53-box merged figure all unchanged at 0. Selftest +10.
+
 ## 0.5.0 — scale
 Tested by merging the whole review corpus into ONE figure: 53 boxes, 52 wires, three
 roots, fan-outs of 20/15/9/8, two levels of hierarchy, all four wire classes. A

@@ -9,6 +9,14 @@ from review feedback on real spec diagrams.
 - **Anchor arrows at computed box edges**, never an eyeballed midpoint. Eyeballing
   caused a real bug where an arrow ended at a box's right edge but only "looked
   right" because the box was drawn over it.
+- **A global signal is a tap, not a wire per block.** Clock, reset and scan go
+  everywhere; drawing them as N long wires costs O(N) crossings and tells the reader
+  nothing they did not assume. `rail()` puts a stub on each block and names the source
+  once. Same for any relation that holds for "all blocks".
+- **Containment and dataflow do not belong in one flat figure.** Layering a graph that
+  mixes "contains" with "sends data to" produces wires that skip three columns and run
+  against the flow. One relation per figure, or draw the hierarchy and annotate the
+  dataflow.
 - **One lane, one wire.** Two wires never share a turn line, even when the stretches
   they occupy don't overlap. Geometrically that is not a crossing; to the eye it is one
   long wire with everything else crossing it, which is the same defect as stacked

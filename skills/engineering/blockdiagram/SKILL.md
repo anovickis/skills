@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.5.0
+version: 0.6.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -36,6 +36,7 @@ d.note(0, 3, "Bus widths", ["TL: 64-bit beat", "Mem: 512-bit ×4ch"], colspan=3)
 d.edge("cpu", "hub", label="TL 64b")           # arrow, optional bus label
 d.edge("hub", "mem", label="AXI4")
 d.edge("cpu", "hub", label="irq[3:0]", cls="interrupt")   # coloured + legend entry
+d.rail("clkgen", ["cpu", "mem", "hub"], label="clk/rst", cls="clock")  # tap per block
 report = d.save("diagrams/foo.svg")                            # writes svg + png, runs lint, prints report
 ```
 
@@ -180,6 +181,28 @@ use spans so connection lengths stay short and the result doesn't read as a rigi
 grid. Autoplace gives a bounded heuristic seed; there is intentionally **no
 wire-length-minimizing solver** (that is ASIC place-and-route) — final arrangement
 is a design choice. See `references/aesthetics.md` for the principle→mechanism map.
+
+## Global signals: `rail()`, not one wire per block
+```python
+d.rail("clkgen", ["core0", "core1", "l2", "uart"], label="clk/rst", cls="clock")
+```
+Clock, reset and scan go everywhere, and drawing them as one wire per block is what
+wrecks a deep diagram — eleven of them across five levels measured **hundreds** of
+crossings, and no router can help, because those wires genuinely do go everywhere. A
+spec does not draw them either: it draws a **tap** at each block and names the source
+once. `rail()` does that — a short stub on each target, `O(1)` ink per block, nothing
+to cross. The relationship stays in the diagram source (`src` is recorded on every tap),
+it is simply not traced across the figure. Taps take no part in placement.
+
+## Depth
+Containment depth is free: a 5-level tree of 46 boxes draws with **0 crossings**. What
+costs crossings is *cross-level dataflow* mixed into the same figure — a refill path
+from a leaf back to a shared cache, interrupts from the periphery to the cores. Measured
+on one 48-box figure: 0 crossings with containment alone, 12 with 4 such wires, 105 with
+10, 116 with 20. If a figure needs both, the options in order of preference are: draw
+`rail()` for anything global; split the relations into separate figures; or accept the
+crossings, which the lint counts for you. A flat layered grid cannot express containment
+and dataflow at once — there is no box-in-box nesting.
 
 ## Kinds
 - `block` — normal sub-block (light blue).
