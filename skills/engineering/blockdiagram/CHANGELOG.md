@@ -1,5 +1,20 @@
 # Changelog — `blockdiagram` skill
 
+## 0.7.1 — a draft that says it is one
+The effort setting now travels with the output three ways: the lint summary names it
+(`lint: OK (effort=fast)`), a fast draw adds a `NOTE` line saying what was traded, and the
+SVG carries `data-effort` so the file itself records how it was drawn.
+
+The hazard of two settings is not the code, it is a quick draw passing for a finished
+figure weeks later, when nobody remembers which it was. `NOTE` deliberately is not `WARN`
+-- the setting was asked for, so it is provenance rather than a complaint, and it must not
+turn a clean draft into "warnings only". That exposed a small bug in the summary line while
+adding it: it read "OK" only when the report was entirely empty, so a NOTE alone would have
+printed "warnings only". It now looks at failures and warnings, not at emptiness.
+
+Full-effort geometry is unchanged: all eight samples render identically bar the one
+provenance line.
+
 ## 0.7.0 — a draft setting
 `Diagram(..., effort="fast")`, and `--fast` on the graph bridge. Over the eight samples:
 **3.5x quicker for 21% more crossings** (23.2s → 6.6s, 77 → 93). On a 40-box hierarchy,

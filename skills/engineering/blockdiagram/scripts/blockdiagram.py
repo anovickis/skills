@@ -1287,7 +1287,9 @@ class Diagram:
                 self.W = max(self.W, x + self.margin)
                 self.H = max(self.H, y + self.margin)
         o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.W:.0f}" '
-             f'height="{self.H:.0f}" viewBox="0 0 {self.W:.0f} {self.H:.0f}" font-family="Arial">']
+             f'height="{self.H:.0f}" viewBox="0 0 {self.W:.0f} {self.H:.0f}" '
+             f'font-family="Arial" data-effort="{self.effort_name}">',
+             f'<!-- blockdiagram: drawn at {self.effort_name} effort -->']
         # One arrowhead marker per line weight. Two things this gets right that the
         # previous version did not:
         #
@@ -1528,7 +1530,12 @@ class Diagram:
         for level, msg in report:
             print(f"  [{level}] {msg}")
         fails = [m for l, m in report if l == "FAIL"]
-        print("  lint: " + ("OK" if not report else ("FAILED" if fails else "warnings only")))
+        # The effort goes on the summary line, always. A draft that looks finished is the
+        # one real hazard of having two settings -- somebody ships the quick one by
+        # accident -- so every report says which was used, and the SVG records it too.
+        warns = [m for l, m in report if l == "WARN"]
+        print("  lint: " + ("FAILED" if fails else ("warnings only" if warns else "OK"))
+              + f" (effort={self.effort_name})")
         return report
 
     def lint(self, reroute=True):
@@ -1634,6 +1641,13 @@ class Diagram:
                 if ch not in seen and M.missing(ch):
                     seen.add(ch)
                     rep.append(("WARN", f"glyph {ch!r} missing from font (edge label)"))
+        # Drawn quickly, and saying so. NOTE rather than WARN because the setting was
+        # asked for -- it is provenance, not a complaint, and it must not turn a clean
+        # draft into "warnings only" or fail anybody's gate.
+        if self.effort_name != "full":
+            rep.append(("NOTE", f"drawn at {self.effort_name} effort: fewer arrangements "
+                                f"tried, so expect more crossings than a full-effort "
+                                f"draw. Re-draw at full effort for a figure you ship."))
         # aesthetic advisories (not failures)
         nx = self._crossings()
         if nx:
@@ -1989,6 +2003,23 @@ def _selftest():
           full._crossings() <= fast._crossings())
     check("fast mode: an unknown effort name falls back to full",
           Diagram("x", effort="turbo").effort_name == "full")
+
+
+    # the effort setting is part of the report, so a draft cannot pass for a final figure
+    d27 = Diagram("effort on the report", cols=2, rows=1, effort="fast")
+    d27.box("a", 0, 0, "A"); d27.box("b", 1, 0, "B")
+    d27.edge("a", "b", label="d [64]")
+    rep27 = d27.lint()
+    check("effort: a fast draw says so in its report",
+          any(l == "NOTE" and "fast effort" in m for l, m in rep27))
+    check("effort: the note is not a warning and not a failure",
+          not any(l in ("FAIL", "WARN") for l, _ in rep27))
+    check("effort: the SVG records how it was drawn",
+          'data-effort="fast"' in d27._svg())
+    d28 = Diagram("full", cols=2, rows=1)
+    d28.box("a", 0, 0, "A"); d28.box("b", 1, 0, "B")
+    d28.edge("a", "b", label="d [64]")
+    check("effort: a full draw carries no note", not d28.lint())
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

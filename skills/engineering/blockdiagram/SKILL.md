@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.7.0
+version: 0.7.1
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -126,6 +126,13 @@ Fast is not uniformly worse, either — with a shorter search it sometimes lands
 (one sample went 9 crossings to 4). It is less *thorough*, not systematically worse.
 
 The graph bridge takes `--fast`.
+
+**A draft says so.** Every lint report ends with the effort it was drawn at
+(`lint: OK (effort=fast)`), a fast draw adds a `NOTE` line explaining what was traded, and
+the SVG itself carries `data-effort`. The hazard of having two settings is not the code, it
+is a quick draw passing for a finished figure — so the setting travels with both the report
+and the file. `NOTE` is not `WARN`: it is provenance, not a complaint, and it cannot turn a
+clean draft into "warnings only" or fail a gate.
 
 ## Cost
 The router searches: for each wire it considers up to forty three-segment paths and, when
