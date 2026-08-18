@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.6.1
+version: 0.7.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -106,6 +106,26 @@ report = d.save("diagrams/foo.svg")                            # writes svg + pn
   block, grey dashed IP), **bus labels** on edges.
 - **Measured text**: boxes size to real font metrics (PIL + Arial-metric font),
   with a heuristic fallback; glyph coverage checked against the actual font.
+
+## Effort: draft while you iterate, full for the figure you ship
+```python
+d = Diagram("Title", effort="fast")     # default is "full"
+```
+Fast mode tries fewer *arrangements*: measured over eight samples, **3.5x quicker for 21%
+more crossings** (23.2s → 6.6s, 77 → 93); on a 40-box hierarchy, 46s → 14s for 25 → 40.
+Use it in the draw-look-adjust loop, then render the real figure at full effort.
+
+What fast mode does **not** trade is legality. Nothing under a box, no wire along another,
+no loops — the router's search for a legal path is identical at either setting. Narrowing
+*that* was tried for speed and rejected: at a dozen tracks instead of forty the router
+sometimes finds no legal path and falls back to a straight one, which put 21 wires under
+boxes across the samples. Crossings are an aesthetic cost and fair game for a draft; a
+wire hidden under a block is a lie about the design. The self-test asserts this.
+
+Fast is not uniformly worse, either — with a shorter search it sometimes lands better
+(one sample went 9 crossings to 4). It is less *thorough*, not systematically worse.
+
+The graph bridge takes `--fast`.
 
 ## Cost
 The router searches: for each wire it considers up to forty three-segment paths and, when

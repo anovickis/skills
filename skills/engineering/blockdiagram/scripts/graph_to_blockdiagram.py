@@ -309,6 +309,8 @@ def main():
     ap.add_argument("--modules", nargs="+", help="explicit module names instead of --root")
     ap.add_argument("-o", "--out", default="diagram.svg", help="output SVG (a PNG is written beside it)")
     ap.add_argument("--emit-dsl", action="store_true", help="print the DSL instead of rendering")
+    ap.add_argument("--fast", action="store_true",
+                    help="draft quality: a few times quicker, more crossings, same rules")
     ap.add_argument("--no-rails", action="store_true",
                     help="draw clock/reset as individual wires instead of a tap per block")
     ap.add_argument("--label-edges", action="store_true", help="label arrows 'instantiates'")
@@ -374,7 +376,7 @@ def main():
     except ImportError as exc:
         sys.exit(f"blockdiagram engine not importable from {skill}: {exc}\n"
                  f"Set --skill-path or $BLOCKDIAGRAM_SKILL to the skill's scripts/ dir.")
-    d = Diagram(title)
+    d = Diagram(title, effort="fast" if a.fast else "full")
     for nid in keep:
         n = nodes[nid]
         desc = _port_desc(n)

@@ -1,5 +1,29 @@
 # Changelog — `blockdiagram` skill
 
+## 0.7.0 — a draft setting
+`Diagram(..., effort="fast")`, and `--fast` on the graph bridge. Over the eight samples:
+**3.5x quicker for 21% more crossings** (23.2s → 6.6s, 77 → 93). On a 40-box hierarchy,
+46s → 14.2s for 25 → 40 crossings. Default is unchanged and byte-identical.
+
+Fast mode shortens the ladder -- two ordering sweeps instead of eight, one polish round
+instead of three, no adjacent-swap sweep, one round of module moves, no rip-up. The
+adjacent-swap sweep is where the time actually went on a fan-heavy diagram: one full
+re-route per swap, per side, per round, so twenty wires off one box cost twenty re-routes.
+Keeping the whole-side reversal (a fan attached in the wrong sense is one move from right)
+and dropping the swap sweep is most of the saving.
+
+What it does NOT trade is legality. The router's search for a legal path is identical at
+either setting, and the self-test asserts that fast mode produces no wire under a box, none
+along another and none looping. Narrowing that search was tried first -- a dozen tracks
+instead of forty, five instead of ten -- and rejected: it was 7x quicker and put **21**
+wires under boxes or along other wires across the samples. Crossings are an aesthetic cost
+and fair game for a draft; a wire hidden under a block is a lie about the design.
+
+Two honest notes. Capping the ladder ALONE, without touching the polish sweep, bought only
+1.2x -- the ladder's rounds already stop early when a round finds nothing, so the knob that
+looked obvious did almost nothing. And fast is not uniformly worse: one sample came out at
+4 crossings against full effort's 9. It is less thorough, not systematically worse.
+
 ## 0.6.1 — five times faster, same drawings
 A 40-box hierarchy took **229 s**; it now takes **45.8 s**, and the self-test went from
 over two minutes to **5.6 s**. Every one of the eight sample diagrams renders to a

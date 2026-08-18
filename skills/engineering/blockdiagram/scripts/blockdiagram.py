@@ -199,9 +199,30 @@ class _Edge:
 
 
 class Diagram:
+    # How hard the crossing ladder and the router look. "full" is the shipping
+    # quality; "fast" is for the loop where you draw, look, and adjust -- see EFFORT.
+    # Fast mode shortens the LADDER -- how many arrangements are tried -- and never the
+    # router's search for a legal path. Narrowing that search was tried and rejected: with
+    # a dozen tracks instead of forty the router sometimes finds no legal path at all and
+    # falls back to a straight one, which put 21 wires under boxes or along other wires
+    # across the sample set. Crossings are an aesthetic cost and fair game for a draft;
+    # a wire hidden under a block is a lie about the design, at any effort.
+    EFFORT = {
+        #                 untangle  move  ripup   (router breadth is not negotiable)
+        "full": dict(untangle=8, polish=3, swaps=True, move=3, ripup=2),
+        "fast": dict(untangle=2, polish=1, swaps=False, move=1, ripup=0),
+    }
+
     def __init__(self, title, cols=None, rows=None, gap_x=72, gap_y=44,
-                 margin=24, title_h=34):
+                 margin=24, title_h=34, effort="full"):
+        """`effort="fast"` trades crossings for time: it tries fewer arrangements, so a
+        figure comes out in a fraction of the time with more crossings in it. The hard
+        rules are NOT traded -- nothing under a box, no wire along another, no loops --
+        because the router's search for a legal path is the same either way. Use it while
+        iterating on a diagram, and draw the one you are shipping at full effort."""
         self.title = title
+        self.effort = self.EFFORT.get(effort, self.EFFORT["full"])
+        self.effort_name = effort if effort in self.EFFORT else "full"
         self.ncol, self.nrow = cols, rows
         self.gap_x, self.gap_y, self.margin, self.title_h = gap_x, gap_y, margin, title_h
         self.boxes = {}
@@ -681,7 +702,7 @@ class Diagram:
         return sum(1 for i, (a, ea) in enumerate(segs)
                    for b, eb in segs[i + 1:] if ea != eb and _crosses(a, b))
 
-    def _untangle(self, rounds=8):
+    def _untangle(self, rounds=None):
         """Reshuffle which wire attaches where, to reduce crossings.
 
         Routing decides how ONE wire gets across the page. Most crossings are not
@@ -701,6 +722,7 @@ class Diagram:
         worse than not running it.
         """
         self._route()
+        rounds = self.effort["untangle"] if rounds is None else rounds
         best_n, best_hint = self._quality(), None
         hint, seen = None, set()
         for _ in range(rounds):                       # barycentre sweep
@@ -731,8 +753,13 @@ class Diagram:
         # the knots it leaves. Reversing a whole side is included because a fan-out
         # attached in exactly the wrong sense is one move from correct and many
         # adjacent swaps from it.
+        # This is where the time goes on a fan-heavy diagram: one re-route per adjacent
+        # swap, per side, per round -- twenty wires off one box is twenty re-routes. Fast
+        # mode keeps the whole-side reversal, which is the cheap high-value move (a fan
+        # attached in exactly the wrong sense is one move from right), and skips the
+        # adjacent-swap sweep, which is the expensive one.
         cur = dict(best_hint) if best_hint else {}
-        for _ in range(3):
+        for _ in range(self.effort["polish"]):
             if best_n == (0, 0):
                 break
             improved = False
@@ -751,7 +778,7 @@ class Diagram:
                     best_n, best_hint, cur = n, dict(trial), trial
                     improved = True
                     order.reverse()
-                for i in range(len(order) - 1):
+                for i in range(len(order) - 1) if self.effort["swaps"] else ():
                     trial = dict(cur)
                     a, b = order[i], order[i + 1]
                     trial[a], trial[b] = cur.get(b, i + 1), cur.get(a, i)
@@ -811,7 +838,7 @@ class Diagram:
         self._layout(); self._route(getattr(self, "_hint", None) or None)
         return self._quality()
 
-    def _move_modules(self, rounds=3):
+    def _move_modules(self, rounds=None):
         """Rung 3: move the modules, so the wires need not cross at all.
 
         Some crossings are not a routing problem and not an ordering problem -- they
@@ -825,6 +852,7 @@ class Diagram:
         different row, then to a neighbouring column. Keeps a move only if it
         measurably reduces crossings.
         """
+        rounds = self.effort["move"] if rounds is None else rounds
         best = self._score()
         for _ in range(rounds):
             if best == (0, 0):
@@ -866,7 +894,7 @@ class Diagram:
                 break
         return best
 
-    def _ripup(self, rounds=2):
+    def _ripup(self, rounds=None):
         """Rung 5: let a tangled wire re-route ahead of the ones it fights with.
 
         Routing is sequential, so the wire that goes first gets the clean corridor and
@@ -874,7 +902,10 @@ class Diagram:
         that would have gone straight was routed second. Rip up the wires involved in
         crossings and give them first pick.
         """
+        rounds = self.effort["ripup"] if rounds is None else rounds
         best = self._score()
+        if not rounds:
+            return best
         self._boost = set(getattr(self, "_boost", set()))
         for _ in range(rounds):
             if best == (0, 0):
@@ -1931,6 +1962,33 @@ def _selftest():
     check("rail: taps introduce no FAIL",
           not any(l == "FAIL" for l, _ in rep15))
     check("rail: taps do not drive placement", d15.boxes["clk"].col <= d15.boxes["b0"].col)
+
+
+    # ---- fast mode ---------------------------------------------------------------
+    # Fast mode may cost crossings. It may NOT cost legality: a wire hidden under a block
+    # is a lie about the design, at any effort. (Narrowing the router's own search was
+    # tried for speed and rejected for exactly this -- it put 21 wires under boxes or
+    # along other wires across the sample set.)
+    def _fanned(effort):
+        d = Diagram("fan", effort=effort)
+        d.node("hub", "Hub", kind="emphasis")
+        for i in range(9):
+            d.node(f"k{i}", f"Kid{i}")
+            d.edge("hub", f"k{i}", label=f"bus{i}_d_bits_data [64]", weight="bus")
+        for i in range(0, 9, 3):
+            d.node(f"s{i}", f"Sink{i}")
+            d.edge(f"k{i}", f"s{i}", label=f"out{i} [64]")
+        return d
+    import time as _time
+    t0 = _time.time(); full = _fanned("full"); full.lint(); t_full = _time.time() - t0
+    t0 = _time.time(); fast = _fanned("fast"); rep_fast = fast.lint(); t_fast = _time.time() - t0
+    check("fast mode: no wire under a box, none along another, none looping",
+          not any(l == "FAIL" for l, _ in rep_fast))
+    check("fast mode: quicker than full", t_fast < t_full)
+    check("fast mode: full effort is still the better drawing",
+          full._crossings() <= fast._crossings())
+    check("fast mode: an unknown effort name falls back to full",
+          Diagram("x", effort="turbo").effort_name == "full")
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails
