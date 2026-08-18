@@ -72,13 +72,25 @@ def _labels(svg):
     return out
 
 
-def _label_anchor(pts):
-    """Where the renderer puts a wire's label: centred over its longest horizontal run."""
-    runs = [(abs(a[0] - b[0]), a, b) for a, b in zip(pts, pts[1:]) if abs(a[1] - b[1]) < 1]
-    if not runs:
-        return None
-    _, a, b = max(runs)
-    return (a[0] + b[0]) / 2, a[1]
+def _dist_to_wire(pt, pts):
+    """Shortest distance from a label to any point on the wire.
+
+    Do NOT assume where along the wire the renderer chose to put the label. It slides
+    the text along a run and may drop it below the line to keep clear of a box, so an
+    anchor fixed at "centre of the longest run" stopped matching and this checker
+    reported names as LOST that were plainly drawn in the SVG. Measuring to the wire
+    itself is independent of that policy -- the checker tests the drawing, not the
+    drawing's current habits.
+    """
+    px, py = pt
+    best = float("inf")
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        if abs(x2 - x1) < 1e-9 and abs(y2 - y1) < 1e-9:
+            continue
+        t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / ((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        t = max(0.0, min(1.0, t))
+        best = min(best, abs(px - (x1 + t * (x2 - x1))) + abs(py - (y1 + t * (y2 - y1))))
+    return best
 
 
 def _match_labels(wires, labels):
@@ -91,14 +103,13 @@ def _match_labels(wires, labels):
     """
     pairs = []
     for wi, pts in enumerate(wires):
-        anc = _label_anchor(pts)
-        if anc is None:
+        if len(pts) < 2:
             continue
         for li, (lx, ly, txt) in enumerate(labels):
             if not txt:
                 continue
-            d = abs(lx - anc[0]) + abs(ly - anc[1])
-            if d < 60:
+            d = _dist_to_wire((lx, ly), pts)
+            if d < 40:
                 pairs.append((d, wi, li))
     pairs.sort()
     out, tw, tl = {}, set(), set()
@@ -111,11 +122,16 @@ def _match_labels(wires, labels):
 
 
 def _parse_label(txt):
-    """`16x name 128b` -> (name, bits). Either part may be absent."""
+    """`16x name [128]` -> (name, bits). Either part may be absent.
+
+    Widths are written in Verilog notation, so that is what is parsed. The older `128b`
+    form is still read: diagrams already drawn should not stop verifying because the
+    notation improved.
+    """
     if not txt:
         return None, None
     t = re.sub(r"^\d+x\s+", "", txt)
-    m = re.search(r"(\d+)b$", t)
+    m = re.search(r"\[(\d+)\]$", t) or re.search(r"(\d+)b$", t)
     bits = int(m.group(1)) if m else None
     name = t[:m.start()].strip() if m else t.strip()
     return (name or None), bits

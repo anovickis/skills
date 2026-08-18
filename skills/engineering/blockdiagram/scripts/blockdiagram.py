@@ -7,10 +7,12 @@ Design choices (enforced, not re-derived each time):
   * Boxes auto-fit: sized to MEASURED text (PIL + an Arial-metric font), with a
     heuristic fallback if PIL/font are unavailable.
   * Edge-anchored ORTHOGONAL routing: arrows attach at computed box edges, run
-    at right angles through column/row GAP corridors (not through boxes), and
-    parallel runs sharing a corridor are pushed into separate lanes. This is not
-    an autorouter — for awkward cases set src_side/dst_side or add a waypoint;
-    the lint will FAIL if a wire still crosses a third box.
+    at right angles through column/row GAP corridors, never under a box and never
+    along another wire — every placed wire becomes an obstacle to the ones after
+    it, and corridors are divided into tracks so several wires can share a gutter
+    side by side rather than on top of each other. Among the legal paths it takes
+    the one with fewest crossings, then the shortest. For awkward cases set
+    src_side/dst_side or add a waypoint; the lint reports what it could not solve.
   * Small, proportional arrowheads.
   * Optional ports: declare named connection points on a side and attach edges
     to them ("box:port"); ports are drawn only when declared.
@@ -358,7 +360,6 @@ class Diagram:
     def _route(self):
         self._vgap_cache = None
         self._hgap_cache = None
-        self._hlanes = {}
         # pass 1: pick a side for each edge end
         info = []
         for e in self.edges:
@@ -438,161 +439,224 @@ class Diagram:
                 else:                             # several wires on one side
                     pass                          # positions assigned below, together
 
-        # pass 3: build orthogonal (or straight) point lists
-        corridor = {}
+        # pass 3: build orthogonal (or straight) point lists.
+        #
+        # Order matters. Each wire is an obstacle to the ones after it, so the short
+        # direct hops are routed FIRST -- they have the least freedom and most deserve
+        # to be straight, and a long wire has the whole canvas to detour through. Doing
+        # it in declaration order let an incidental long wire take the gutter a
+        # neighbouring pair needed.
+        self._used = []
+        ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            sp = s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")]
-            dp = d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")]
+            ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
+                         d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")])
+        order = sorted(range(len(info)),
+                       key=lambda i: abs(ends[i][0][0] - ends[i][1][0]) +
+                                     abs(ends[i][0][1] - ends[i][1][1]))
+        for idx in order:
+            e, s, d, ss, ds = info[idx]
+            sp, dp = ends[idx]
             if e.shape == "straight":
                 e.pts = [sp, dp]
             elif ss in "LR" and ds in "LR":
-                if abs(sp[1] - dp[1]) < 1:
+                # Level ends can go straight across -- but ONLY if nothing is in the
+                # way. This short-circuit did not check, so two boxes level with each
+                # other drew a wire straight through every block between them, and it
+                # was the single worst offender in a crowded diagram: one such wire
+                # accounted for four of the overlaps and three of the wires under
+                # blocks. Level is a reason to PREFER the straight path, not to skip
+                # the check.
+                if abs(sp[1] - dp[1]) < 1 and not any(
+                        _seg_in_box((sp, dp), b) for b in self.boxes.values()):
                     e.pts = [sp, dp]
                 else:
                     default = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
-                    pts = self._ortho_route(sp, dp, default, {s.id, d.id},
-                                            1 if ss == "R" else -1, corridor)
-                    e.pts = pts
-            elif ss in "TB" and ds in "TB":
-                if abs(sp[0] - dp[0]) < 1:
-                    e.pts = [sp, dp]
-                else:
-                    midy = (sp[1] + dp[1]) / 2
-                    e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
+                    e.pts = self._ortho_route(sp, dp, default, {s.id, d.id},
+                                              1 if ss == "R" else -1)
+                    continue                       # _ortho_route records its own path
+            elif (ss in "TB" and ds in "TB" and abs(sp[0] - dp[0]) < 1
+                  and not any(_seg_in_box((sp, dp), b) for b in self.boxes.values())):
+                e.pts = [sp, dp]
             else:
                 midy = (sp[1] + dp[1]) / 2
                 e.pts = [sp, (sp[0], midy), (dp[0], midy), dp]
+            # A wire the router did not place is still a wire, and later wires must
+            # treat it as occupied ground -- otherwise they are routed around only
+            # SOME of what is on the canvas.
+            self._remember(e.pts)
+
+    @staticmethod
+    def _free_spans(spans, before, after):
+        """Merge box extents on one axis and return the free bands between them."""
+        gaps, cur = [], None
+        for a0, a1 in sorted(spans):
+            if cur is None:
+                cur = [a0, a1]
+                continue
+            if a0 > cur[1]:
+                gaps.append((cur[1], a0))
+                cur = [a0, a1]
+            else:
+                cur[1] = max(cur[1], a1)
+        if cur is not None:
+            gaps.append((cur[1], cur[1]))
+        out = [g for g in gaps if g[1] - g[0] > 6]
+        if spans:
+            lo = min(s[0] for s in spans)
+            hi = max(s[1] for s in spans)
+            out.append((lo - before, lo - 6))
+            out.append((hi + 6, hi + after))
+        return out
+
+    def _vgap_spans(self):
+        """Vertical corridors as (lo, hi) RANGES, not centres.
+
+        A centre is one line, and one line holds one wire. Handing the router the whole
+        width of each gutter is what lets several wires share a corridor while each
+        keeping its own track -- the difference between three buses drawn side by side
+        and three buses drawn on top of each other, which is what "they merge into one"
+        was.
+        """
+        if getattr(self, "_vgap_cache", None) is None:
+            self._vgap_cache = self._free_spans(
+                [(b.x, b.right) for b in self.boxes.values()],
+                self.gap_x, self.gap_x)
+        return self._vgap_cache
+
+    def _hgap_spans(self):
+        if getattr(self, "_hgap_cache", None) is None:
+            out = self._free_spans([(b.y, b.bottom) for b in self.boxes.values()],
+                                   self.gap_y, self.gap_y)
+            # Never above the title -- a corridor at the very top drew wires straight
+            # through the diagram's own heading.
+            self._hgap_cache = [(max(lo, self.title_h + 6), hi) for lo, hi in out
+                                if hi > self.title_h + 12]
+        return self._hgap_cache
+
+    @staticmethod
+    def _tracks(spans, near):
+        """Every legal track in these corridors, nearest the wanted position first.
+
+        Tracks are LANE apart, so two wires assigned different tracks can never be
+        drawn on top of one another however long they run together.
+        """
+        out = []
+        for lo, hi in spans:
+            if hi - lo < 2:
+                out.append((lo + hi) / 2)
+                continue
+            lo, hi = lo + 3, hi - 3
+            n = max(int((hi - lo) // LANE) + 1, 1)
+            if n == 1:
+                out.append((lo + hi) / 2)
+                continue
+            # centred run of n tracks
+            start = (lo + hi) / 2 - (n - 1) * LANE / 2
+            out += [start + i * LANE for i in range(n)]
+        return sorted(out, key=lambda v: abs(v - near))
 
     def _vgaps(self):
-        """Vertical corridors: x centres of the free columns between boxes.
-
-        Cached per layout. These are the lanes a wire can run down without passing
-        through anything -- the gutters the grid already leaves between columns.
-        """
-        if getattr(self, "_vgap_cache", None) is not None:
-            return self._vgap_cache
-        spans = sorted((b.x, b.right) for b in self.boxes.values())
-        gaps, cur = [], None
-        for x0, x1 in spans:
-            if cur is None:
-                cur = [x0, x1]
-                continue
-            if x0 > cur[1]:
-                gaps.append((cur[1], x0))
-                cur = [x0, x1]
-            else:
-                cur[1] = max(cur[1], x1)
-        out = [(a + b) / 2 for a, b in gaps if b - a > 6]
-        if spans:
-            out.append(spans[0][0] - self.gap_x / 2)      # left of everything
-            out.append(spans[-1][1] + self.gap_x / 2)     # right of everything
-        self._vgap_cache = out
-        return out
+        return [(a + b) / 2 for a, b in self._vgap_spans()]
 
     def _hgaps(self):
-        """Horizontal corridors: y centres of the free bands between rows."""
-        if getattr(self, "_hgap_cache", None) is not None:
-            return self._hgap_cache
-        spans = sorted((b.y, b.bottom) for b in self.boxes.values())
-        gaps, cur = [], None
-        for y0, y1 in spans:
-            if cur is None:
-                cur = [y0, y1]
-                continue
-            if y0 > cur[1]:
-                gaps.append((cur[1], y0))
-                cur = [y0, y1]
-            else:
-                cur[1] = max(cur[1], y1)
-        out = [(a + b) / 2 for a, b in gaps if b - a > 6]
-        if spans:
-            # Above the first row, but BELOW the title -- a corridor at the very top
-            # drew wires straight through the diagram's own heading.
-            top = spans[0][0] - self.gap_y / 2
-            if top > self.title_h + 6:
-                out.append(top)
-            out.append(spans[-1][1] + self.gap_y / 2)
-        self._hgap_cache = out
-        return out
+        return [(a + b) / 2 for a, b in self._hgap_spans()]
 
-    def _ortho_route(self, sp, dp, default, skip_ids, sign, corridor):
-        """An orthogonal path from sp to dp that does not pass under a box.
+    def _ortho_route(self, sp, dp, default, skip_ids, sign):
+        """An orthogonal path from sp to dp that shares no ground with anything else.
 
-        Tries the cheap shape first and only escalates:
+        Three hard rules, in order. A path that breaks one is not drawn:
 
-          3 segments   out to a vertical gutter, along it, in to the target
-          5 segments   out to a gutter, along it to a clear HORIZONTAL band,
-                       across, then into the target
+          1. it may not pass under a box
+          2. it may not run along another wire -- crossing at 90 degrees is fine,
+             travelling together is not
+          3. of the paths that satisfy both, take the one that crosses fewest wires,
+             then the shortest, then the one with fewest corners
 
-        The 3-segment form cannot succeed when the target is several columns away,
-        because its final horizontal run has to cross the intervening columns at the
-        target's own height, and that is exactly where their boxes are. That is why
-        wires were being drawn under blocks: not a bad choice of gutter, but a shape
-        with nowhere legal to go. The 5-segment form leaves the row band entirely and
-        travels in a gutter between rows.
+        Rule 2 is the one that was missing, and missing completely: the old clearance
+        test asked only whether a path hit a BOX. Wires already on the canvas were
+        invisible to it, so three buses that all wanted the same gutter all got it and
+        were drawn one on top of another -- which is exactly what "the three wide ones
+        merge into one" looks like when the top wire is the widest. Lane offsets did not
+        help because they were applied AFTER the check and never verified, so a lane
+        shift could land a wire straight back on its neighbour.
 
-        Falls back to the original 3-segment path when nothing is clear, so the result
-        is never worse than before and the lint still reports it.
+        Every placed segment is now recorded, and every candidate is tested against the
+        record. Corridors are searched by TRACK rather than by centreline, so a gutter
+        holds as many wires as it has room for, side by side.
         """
-        obstacles = [b for b in self.boxes.values() if b.id not in skip_ids]
+        # EVERY box is an obstacle, including this wire's own two. Excluding them was
+        # meant to let a wire touch the boxes it connects, but a segment that merely
+        # touches an edge is not "in" the box by _seg_in_box's margin anyway -- all the
+        # exclusion actually bought was permission for a wire to be drawn straight
+        # THROUGH its own source, which is what a stub leaving the right edge and
+        # heading left across the block was.
+        obstacles = list(self.boxes.values())
+        used = self._used
 
-        def lane_shift(mx):
-            bucket = round(mx / LANE)
-            lane = corridor.get(bucket, 0)
-            corridor[bucket] = lane + 1
-            return mx + lane * LANE * sign
+        def hits_box(segs):
+            return any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
 
-        def clear(pts):
-            segs = list(zip(pts, pts[1:]))
-            return not any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
+        def overlaps(segs):
+            return any(_stacked(sg, u) for sg in segs for u in used)
 
-        # 1. three segments, preferring the gutter nearest the default
-        cands = [default] + sorted(self._vgaps(), key=lambda x: abs(x - default))
-        for mx in cands:
+        def crossings(segs):
+            return sum(1 for sg in segs for u in used if _crosses(sg, u))
+
+        def length(pts):
+            return sum(abs(q[0] - r[0]) + abs(q[1] - r[1]) for q, r in zip(pts, pts[1:]))
+
+        best = None
+        vt = self._tracks(self._vgap_spans(), default)
+
+        def consider(pts, corners):
+            nonlocal best
+            segs = [sg for sg in zip(pts, pts[1:]) if sg[0] != sg[1]]
+            if hits_box(segs) or overlaps(segs):
+                return False
+            cost = (crossings(segs), round(length(pts)), corners)
+            if best is None or cost < best[0]:
+                best = (cost, pts)
+            return True
+
+        # 1. three segments: out to a vertical track, along it, in to the target.
+        for mx in vt[:60]:
+            consider([sp, (mx, sp[1]), (mx, dp[1]), dp], 2)
+        # A clean 3-segment path with no crossings cannot be beaten; take it at once.
+        if best is not None and best[0][0] == 0:
+            self._remember(best[1])
+            return best[1]
+
+        # 2. five segments: out to a track, along a horizontal band, in. Needed when
+        # the target is several columns away -- the 3-segment form's last run has to
+        # cross the intervening columns at the target's own height, which is precisely
+        # where their boxes are.
+        ht = self._tracks(self._hgap_spans(), (sp[1] + dp[1]) / 2)
+        for mx in vt[:14]:
+            for ex in self._tracks(self._vgap_spans(), dp[0])[:14]:
+                for my in ht[:14]:
+                    consider([sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp], 4)
+        if best is not None:
+            self._remember(best[1])
+            return best[1]
+
+        # Nothing legal. Keep the simple shape, on a track no one else is using if one
+        # exists, and let the lint report it rather than hiding the failure.
+        for mx in vt:
             pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
-            if clear(pts):
-                mx = lane_shift(mx)
-                return [sp, (mx, sp[1]), (mx, dp[1]), dp]
+            segs = list(zip(pts, pts[1:]))
+            if not overlaps(segs):
+                self._remember(pts)
+                return pts
+        pts = [sp, (default, sp[1]), (default, dp[1]), dp]
+        self._remember(pts)
+        return pts
 
-        # 2. five segments: out, along a row band, in
-        for mx in cands:
-            # The exit corridor should be the one nearest the TARGET. Sorting by
-            # distance from the entry corridor sent wires out to the far edge of the
-            # drawing and back, which is contained but absurd.
-            for ex in sorted(self._vgaps(), key=lambda x: abs(x - dp[0])):
-                for my in sorted(self._hgaps(), key=lambda y: abs(y - (sp[1] + dp[1]) / 2)):
-                    pts = [sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp]
-                    if clear(pts):
-                        return pts
-        return [sp, (lane_shift(default), sp[1]), (lane_shift(default), dp[1]), dp]
-
-    def _clear_vgap(self, sp, dp, default, skip_ids):
-        """Pick a vertical corridor whose three segments miss every box.
-
-        The router used to take the gutter immediately beside the source and commit to
-        it. When that gutter was occupied further along -- which is what happens the
-        moment one box feeds several -- the wire was drawn straight THROUGH whatever
-        stood in the way, and the lint duly reported a wire crossing a box with no way
-        for the engine to avoid it. Now the candidate gutters are tried in order of
-        distance from that first choice and the first clear one wins.
-
-        If none is clear the default is kept, so the drawing is never worse than before
-        and the lint still says so rather than the failure being hidden.
-        """
-        obstacles = [b for b in self.boxes.values() if b.id not in skip_ids]
-        if not obstacles:
-            return default
-
-        def clear(mx):
-            segs = [(sp, (mx, sp[1])), ((mx, sp[1]), (mx, dp[1])), ((mx, dp[1]), dp)]
-            return not any(_seg_in_box(sg, b) for sg in segs for b in obstacles)
-
-        if clear(default):
-            return default
-        for cand in sorted(self._vgaps(), key=lambda x: abs(x - default)):
-            if clear(cand):
-                return cand
-        return default
+    def _remember(self, pts):
+        """Record a placed path so later wires treat it as an obstacle."""
+        for sg in zip(pts, pts[1:]):
+            if sg[0] != sg[1]:
+                self._used.append(sg)
 
     @staticmethod
     def _auto_sides(s, d):
@@ -616,6 +680,7 @@ class Diagram:
     # ---- emit ------------------------------------------------------------
     def _svg(self):
         self._layout(); self._route()
+        self._lbl_boxes = []       # label rectangles already placed, so none collide
         # Grow the canvas to whatever the router actually used. Detour corridors can sit
         # outside the box extents -- that is the point of them -- and the width computed
         # from the grid alone left those wires running off the edge of the drawing.
@@ -662,21 +727,16 @@ class Diagram:
                 # the line back to find out what it is -- so a long wire is named at
                 # BOTH ends. A halo goes behind the glyphs because dark text over a dark
                 # fat wire is simply not readable.
-                runs = [(abs(q[0] - r[0]), q, r) for q, r in zip(e.pts, e.pts[1:])
-                        if abs(q[1] - r[1]) < 1]
                 span = sum(abs(q[0] - r[0]) + abs(q[1] - r[1])
                            for q, r in zip(e.pts, e.pts[1:]))
-                spots = []
-                if runs:
-                    runs.sort()
-                    _, q, r = runs[-1]
-                    spots.append(((q[0] + r[0]) / 2, q[1] - 5 - e.weight / 2))
-                    if span > LABEL_BOTH_ENDS and len(runs) > 1:
-                        _, q2, r2 = runs[-2]
-                        spots.append(((q2[0] + r2[0]) / 2, q2[1] - 5 - e.weight / 2))
-                else:
-                    a, b = e.pts[0], e.pts[-1]
-                    spots.append(((a[0] + b[0]) / 2, min(a[1], b[1]) - 5))
+                # A long wire is named at BOTH ends: when the ends are most of the
+                # diagram apart, one mid-wire label means tracing the line back to
+                # find out what it is.
+                spots = self._label_spots(e, 2 if span > LABEL_BOTH_ENDS else 1)
+                # If there is genuinely nowhere legible, the name is NOT printed on
+                # top of a block to pretend the wire is labelled. The verifier then
+                # reports it, which is the honest outcome: a diagram too crowded to
+                # name its wires needs fewer boxes, not smaller lies.
                 for lx, ly in spots:
                     o.append(f'<text x="{lx:.0f}" y="{ly:.0f}" fill="{GREY}" '
                              f'font-size="{FS_SMALL}" text-anchor="middle" '
@@ -686,6 +746,108 @@ class Diagram:
             o.append(self._box_svg(self.boxes[bid]))
         o.append("</svg>")
         return "\n".join(o)
+
+    def _lbl_free(self, cx, cy, w, e, others):
+        """Is this a legal place for a label? Returns its box, or None.
+
+        Positions are ROUNDED first, because that is what gets written into the SVG
+        (`x="{:.0f}"`). Checking the exact float and emitting the rounded one let a
+        label drift up to half a pixel into a block after it had been approved -- which
+        is precisely how a graze got past the check.
+        """
+        cx, cy = round(cx), round(cy)
+        m = 2                                  # don't let a label graze a block either
+        bb = (cx - w / 2 - m, cy - FS_SMALL - m, cx + w / 2 + m, cy + 2 + m)
+        if any(bb[0] < b.right and bb[2] > b.x and
+               bb[1] < b.bottom and bb[3] > b.y for b in self.boxes.values()):
+            return None
+        if any(bb[0] < o[2] and bb[2] > o[0] and
+               bb[1] < o[3] and bb[3] > o[1] for o in self._lbl_boxes):
+            return None
+        # The label must be unmistakably NEARER its own wire than any other. Without
+        # this a name printed between two closely spaced wires belongs, visually, to
+        # neither -- and reading the finished SVG back showed exactly that: names
+        # swapping between neighbours. A reader cannot resolve that ambiguity any
+        # better than the checker can, so it is a defect in the drawing, not the check.
+        mine = _dist_to_pts((cx, cy), e.pts)
+        if any(_dist_to_pts((cx, cy), p) < mine + 8 for p in others):
+            return None
+        return bb, cx, cy
+
+    def _label_spots(self, e, want):
+        """Find up to `want` places on this wire where its name can actually be read.
+
+        A label centred over the longest run and sitting above the wire is right when
+        there is room, and wrong the moment the run passes a box: half the text vanishes
+        under the block, and a name that is half visible is no name at all.
+
+        So every horizontal run is a candidate, longest first, and within a run the
+        label slides along and may drop below the wire. Chosen spots are also kept clear
+        of each OTHER, so a wire named at both ends does not print its two labels on top
+        of one another, and clear of labels already placed on other wires.
+
+        Dropping the label is the last resort, not the second: an unnamed wire cannot be
+        checked against the RTL by anyone reading the picture, which is the whole point
+        of naming it.
+        """
+        w = _tw(e.label, FS_SMALL)
+        # Only wires with a DIFFERENT name can be confused with this one. Three
+        # parallel wires all called auto_source_in_d_bits_data are not ambiguous --
+        # whichever one a reader attributes the label to, they read the same name --
+        # and treating them as rivals suppressed all three names for no gain.
+        others = [o.pts for o in self.edges
+                  if o is not e and len(o.pts) > 1 and o.label != e.label]
+        runs = sorted(((abs(q[0] - r[0]), q, r) for q, r in zip(e.pts, e.pts[1:])
+                       if abs(q[1] - r[1]) < 1), reverse=True)
+        # A wire that runs mostly vertically has no long horizontal run to sit a name
+        # on. Rather than leave it nameless, treat its vertical runs as candidates too,
+        # with the text beside the line instead of above it.
+        vruns = sorted(((abs(q[1] - r[1]), q, r) for q, r in zip(e.pts, e.pts[1:])
+                        if abs(q[0] - r[0]) < 1 and abs(q[1] - r[1]) > FS_SMALL * 2),
+                       reverse=True)
+        out = []
+        for _, q, r in runs:
+            if len(out) >= want:
+                break
+            x0, x1 = sorted((q[0], r[0]))
+            above = q[1] - 5 - e.weight / 2
+            below = q[1] + FS_SMALL + 3 + e.weight / 2
+            for frac in (0.5, 0.3, 0.7, 0.15, 0.85):
+                cx = x0 + (x1 - x0) * frac
+                # Allow a little overhang: a short run can still carry a name, and the
+                # alternative is no name at all.
+                if cx - w / 2 < x0 - w * 0.4 or cx + w / 2 > x1 + w * 0.4:
+                    continue
+                for cy in (above, below):
+                    got = self._lbl_free(cx, cy, w, e, others)
+                    if not got:
+                        continue
+                    bb, rx, ry = got
+                    self._lbl_boxes.append(bb)
+                    out.append((rx, ry))
+                    break
+                else:
+                    continue
+                break
+        for _, q, r in vruns:
+            if len(out) >= want:
+                break
+            y0, y1 = sorted((q[1], r[1]))
+            for frac in (0.5, 0.3, 0.7):
+                cy = y0 + (y1 - y0) * frac
+                for cx in (q[0] + w / 2 + 5 + e.weight / 2,
+                           q[0] - w / 2 - 5 - e.weight / 2):
+                    got = self._lbl_free(cx, cy, w, e, others)
+                    if not got:
+                        continue
+                    bb, cx, cy = got
+                    self._lbl_boxes.append(bb)
+                    out.append((cx, cy))
+                    break
+                else:
+                    continue
+                break
+        return out
 
     def _box_svg(self, b):
         styles = {
@@ -743,8 +905,16 @@ class Diagram:
         print("  lint: " + ("OK" if not report else ("FAILED" if fails else "warnings only")))
         return report
 
-    def lint(self):
-        self._layout(); self._route()
+    def lint(self, reroute=True):
+        """Geometric checks over the drawn result.
+
+        `reroute=False` checks the geometry exactly as it stands. The router is good
+        enough now that some violations cannot be produced through the normal path at
+        all, so the only way to test that the DETECTOR still works is to hand it
+        constructed geometry -- otherwise the checks quietly become untested.
+        """
+        if reroute:
+            self._layout(); self._route()
         rep = []
         bs = list(self.boxes.values())
         # box overlap
@@ -835,6 +1005,41 @@ def _seg_in_box(seg, b):
             lo_y < b.bottom - m and hi_y > b.y + m)
 
 
+def _dist_to_pts(pt, pts):
+    """Manhattan distance from a point to the nearest point on a polyline."""
+    px, py = pt
+    best = float("inf")
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            continue
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        best = min(best, abs(px - (x1 + t * dx)) + abs(py - (y1 + t * dy)))
+    return best
+
+
+def _crosses(s1, s2):
+    """True if one segment cuts the other at right angles.
+
+    A crossing is allowed -- wires must sometimes cross -- but each one costs a reader
+    a moment, so the router counts them and prefers the path that makes fewest.
+    """
+    (ax1, ay1), (ax2, ay2) = s1
+    (bx1, by1), (bx2, by2) = s2
+    a_h, b_h = abs(ay1 - ay2) < 1, abs(by1 - by2) < 1
+    a_v, b_v = abs(ax1 - ax2) < 1, abs(bx1 - bx2) < 1
+    if a_h and b_v:
+        h, v = s1, s2
+    elif a_v and b_h:
+        h, v = s2, s1
+    else:
+        return False
+    (hx1, hy), (hx2, _) = h
+    (vx, vy1), (_, vy2) = v
+    return (min(hx1, hx2) - 1 < vx < max(hx1, hx2) + 1 and
+            min(vy1, vy2) - 1 < hy < max(vy1, vy2) + 1)
+
+
 def _stacked(s1, s2):
     (ax1, ay1), (ax2, ay2) = s1
     (bx1, by1), (bx2, by2) = s2
@@ -881,12 +1086,22 @@ def _selftest():
     b2.x, b2.y, b2.w, b2.h = b1.x, b1.y, b1.w, b1.h
     check("overlap detected", any("overlap" in m for l, m in d2.lint() if l == "FAIL"))
 
-    # wire-through-box: A (left) -> C (right) with B sitting between, forced straight
+    # wire-through-box. A->C with B between them USED to produce this, because a
+    # wire whose ends were level was drawn straight across without checking what stood
+    # in the way. The router now routes around B, so the lint has nothing to report --
+    # which is the right outcome, but it means the case no longer exercises the lint.
+    # So both things are checked: that the router avoids B, and that the lint still
+    # catches the violation when a path is forced through one.
     d3 = Diagram("t", cols=3, rows=1)
     d3.box("a", 0, 0, "A"); d3.box("bmid", 1, 0, "B"); d3.box("c", 2, 0, "C")
-    d3.edge("a", "c")            # auto LR straight along shared row -> crosses B
+    d3.edge("a", "c")
+    d3._layout(); d3._route()
+    check("router: level ends route AROUND the box between them",
+          not any("crosses box" in m for l, m in d3.lint() if l == "FAIL"))
+    mid = d3.boxes["bmid"]
+    d3.edges[0].pts = [(d3.boxes["a"].right, mid.cy), (d3.boxes["c"].x, mid.cy)]
     check("wire-through-box detected",
-          any("crosses box" in m for l, m in d3.lint() if l == "FAIL"))
+          any("crosses box" in m for l, m in d3.lint(reroute=False) if l == "FAIL"))
 
     # glyph coverage: a clearly-absent glyph warns
     d4 = Diagram("t", cols=1, rows=1)
@@ -944,6 +1159,35 @@ def _selftest():
         d10.box(f"s{r}", 0, r, w); d10.box(f"d{r}", 1, r, w.upper())
         d10.edge(f"s{r}", f"d{r}", weight=w)
     svg = d10._svg()
+    # --- the three rules the router now enforces, on a graph dense enough to break
+    # them. These were all violated before the router treated placed wires as
+    # obstacles: a 20-box fan-out drew 46 pairs of wires along each other.
+    d10 = Diagram("crowded")
+    for i in range(12):
+        d10.node(f"n{i}", f"Block{i}")
+    for i in range(1, 12):
+        d10.edge("n0", f"n{i}", label=f"bus_{i} [64]", weight="bus")
+    for i in range(1, 6):
+        d10.edge(f"n{i}", f"n{i + 6}", label=f"link_{i} [8]")
+    d10.autoplace()
+    svg10 = d10._svg()
+    segs = [sg for e in d10.edges for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+    check("crowded: no wire runs along another wire",
+          not any(_stacked(a, b) for i, a in enumerate(segs) for b in segs[i + 1:]))
+    check("crowded: no wire passes under a box",
+          not any(_seg_in_box(sg, b) for sg in segs for b in d10.boxes.values()
+                  if not any(abs(sg[k][0] - c) < 0.01 or abs(sg[k][1] - r) < 0.01
+                             for k in (0, 1) for c in (b.x, b.right) for r in (b.y, b.bottom))))
+    import re as _re
+    lbls = [(float(m.group(1)), float(m.group(2)), m.group(3)) for m in
+            _re.finditer(r'<text x="([\d.-]+)" y="([\d.-]+)"[^>]*paint-order="stroke">([^<]*)</text>', svg10)]
+    check("crowded: no wire label sits on a block",
+          not any(lx - _tw(t, FS_SMALL) / 2 < b.right and lx + _tw(t, FS_SMALL) / 2 > b.x
+                  and ly - FS_SMALL < b.bottom and ly + 2 > b.y
+                  for lx, ly, t in lbls for b in d10.boxes.values()))
+    check("crowded: most wires still carry their name",
+          len(lbls) >= int(0.8 * len(d10.edges)))
+
     check("weights: signal is 1px", 'stroke-width="1.0"' in svg)
     check("weights: 3 distinct stroke widths",
           all(f'stroke-width="{WEIGHTS[w]:.1f}"' in svg for w in ("signal", "bus", "fat")))

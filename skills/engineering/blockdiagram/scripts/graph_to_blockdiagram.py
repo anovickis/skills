@@ -202,7 +202,11 @@ def _edge_label(e, label_edges, ports=False):
     and only the name lets anyone check the drawing back against the RTL -- which is
     the difference between a picture that illustrates and one that can be audited.
 
-    `8x` is the number of instantiations, not a multiplier on the width: `8x d_data 128b`
+    Width uses Verilog's own notation -- `8x d_data [128]` -- because that is what the
+    reader sees in the RTL, and a diagram that names things the way the source does can
+    be checked against it without translation.
+
+    `8x` is the number of instantiations, not a multiplier on the width: `8x d_data [128]`
     is eight connections each carrying a 128-bit `d_data`, not a 1024-bit bus. The count
     leads so the eye does not read it as arithmetic on the number that follows.
     """
@@ -212,7 +216,7 @@ def _edge_label(e, label_edges, ports=False):
     if ports and e.get("name"):
         parts.append(str(e["name"]))
     if ports and e.get("bits"):
-        parts.append(f"{e['bits']}b")
+        parts.append(f"[{e['bits']}]")
     elif ports:
         parts.append("width n/k")        # known to be unknown, not merely missing
     if label_edges:
