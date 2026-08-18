@@ -7,7 +7,7 @@ translated into a concrete mechanism so it can be enforced, not eyeballed.
 |----------------------------------|-----------------------|--------|
 | **Clear reading direction** — eye flows one way (dataflow L→R) | Layered ranks: `col = longest-path distance from sources`; sinks end up right | autoplace |
 | **Few edge crossings** — crossings read as noise | Median-barycenter row ordering, then two *measured* passes: alternative rankings and adjacent-swap shuffling, each kept only if the counted crossings drop | autoplace |
-| **A bundle reads as a comb** — a fan-out must not cross itself | Lanes in a corridor ordered by travel distance (farthest destination innermost), packed per corridor position, spacing stepped down to fit | route |
+| **A bundle reads as a comb** — a fan-out must not cross itself | Lanes in a corridor ordered by travel distance (farthest destination innermost), one wire per lane, corridor sized for the bundle | route |
 | **Feedback looks like feedback** — a return path shouldn't weave through the forward path | Cycles broken before ranking; back edges taken around the outside in a reserved top/bottom channel, banks split when spans interleave | autoplace + route + layout |
 | **Straight primary datapath** — minimise bends | Single edge between aligned boxes is drawn straight (anchor = overlap-centre); ordering pulls connected boxes toward the same row | route + autoplace |
 | **Aligned structure** — shared edges/centrelines, uniform sizing | Grid: column width = widest box in column, row height = tallest in row; everything snaps to it | layout |
@@ -19,6 +19,7 @@ translated into a concrete mechanism so it can be enforced, not eyeballed.
 | **Legible text** — fits, no tofu | Measured metrics size boxes; glyph-coverage check vs the actual font | layout + lint |
 | **Visual hierarchy** — important vs background | `kind`: emphasis (solid blue), block, ip (grey dashed black box), note | render |
 | **Labelled connections** — buses show width / b/w | `edge(label=...)`; placed on a straight run of its own wire (preferring the arriving run), anchored to the box edge, haloed, collision-checked; the layout spreads if labels don't fit | render + layout |
+| **Class at a glance** — datapath vs control vs clock vs interrupt | `edge(cls=...)` → four house wire colours, arrowhead matched, legend for the classes used | render |
 | **Cardinality at a glance** — 1 wire vs bus vs fat bus | `edge(weight="signal"/"bus"/"fat")` → 1 px / wider / much wider line; arrowhead scales only modestly | render |
 
 ## What the engine deliberately does NOT do (avoid the P&R rabbit hole)

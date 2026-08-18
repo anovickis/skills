@@ -26,6 +26,11 @@ A NOTE ON EDGE LABELS.  An `instantiates` edge carries no bus width or protocol,
 the RTL parse does not know one.  Diagrams therefore come out unlabelled unless you pass
 --label-edges.  Do not read an unlabelled arrow as "no bus" -- it means "not extracted".
 
+WIRE COLOUR follows the signal name where there is one: interrupt / clock+reset /
+control / data, drawn in the skill's four wire colours with a legend for the classes
+present.  With no signal names every wire is "data" and no legend is drawn -- so an
+uncoloured diagram means "names not extracted", exactly like an unlabelled arrow.
+
 Usage:
     graph_to_blockdiagram.py --root <TopModule> --depth 1 -o out.svg
     graph_to_blockdiagram.py --modules CacheCtrl Xbar CpuTile -o cache.svg
@@ -159,6 +164,25 @@ def _edge_label(e, label_edges):
     return "instantiates" if label_edges else None
 
 
+# Wire classes from the signal name. Interrupts and clock/reset wiring are not part of
+# the datapath, and colouring them means a reader can dismiss them without tracing them.
+# Only what the name actually says -- an `instantiates` edge with no signal name stays
+# "data", and a diagram with one class draws no legend.
+_CLASS_PATTERNS = (
+    ("interrupt", ("int_out", "interrupt", "irq", "_int_", "eip")),
+    ("clock", ("clock", "clk", "reset", "rst_")),
+    ("control", ("ctrl", "control", "cfg", "csr", "mmio", "apb", "dmi", "debug")),
+)
+
+
+def _edge_class(label):
+    low = (label or "").lower()
+    for cls, pats in _CLASS_PATTERNS:
+        if any(p in low for p in pats):
+            return cls
+    return "data"
+
+
 def _safe(bid):
     return "".join(c if c.isalnum() or c == "_" else "_" for c in bid)
 
@@ -175,8 +199,9 @@ def emit_dsl(title, keep, kept_edges, nodes, label_edges):
         lines.append(f'd.node({_safe(nid)!r}, {n.get("label", nid)!r}, {desc!r}, kind={kind!r})')
     lines.append("")
     for e in kept_edges:
+        lbl = _edge_label(e, label_edges)
         lines.append(f'd.edge({_safe(e["source"])!r}, {_safe(e["target"])!r}, '
-                     f'label={_edge_label(e, label_edges)!r})')
+                     f'label={lbl!r}, cls={_edge_class(lbl)!r})')
     lines += ["", 'print(d.save("diagram.svg"))']
     return "\n".join(lines)
 
@@ -254,7 +279,8 @@ def main():
                ["not defined in corpus"] if n.get("external") else None,
                kind="ip" if n.get("external") else "block")
     for e in kept_edges:
-        d.edge(_safe(e["source"]), _safe(e["target"]), label=_edge_label(e, a.label_edges))
+        lbl = _edge_label(e, a.label_edges)
+        d.edge(_safe(e["source"]), _safe(e["target"]), label=lbl, cls=_edge_class(lbl))
     report = d.save(a.out)
     print(report)
     if any(level == "FAIL" for level, _ in (report or [])):

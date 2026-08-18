@@ -9,6 +9,15 @@ from review feedback on real spec diagrams.
 - **Anchor arrows at computed box edges**, never an eyeballed midpoint. Eyeballing
   caused a real bug where an arrow ended at a box's right edge but only "looked
   right" because the box was drawn over it.
+- **One lane, one wire.** Two wires never share a turn line, even when the stretches
+  they occupy don't overlap. Geometrically that is not a crossing; to the eye it is one
+  long wire with everything else crossing it, which is the same defect as stacked
+  parallel lines — a connection you cannot follow.
+- **Colour carries class, not decoration.** Four wire classes (data, control,
+  clock+reset, interrupt), a legend for the ones used, arrowheads in the wire's own
+  colour. Interrupt and clock/reset wiring is not datapath, and colour lets a reader
+  skip it instead of tracing it. Do not add a fifth class to mean something else —
+  use a label.
 - **Crossings are counted, and mostly avoidable.** `lint()` intersects the routed
   wires and WARNs with the number, so "looks about right" is not the test. Most
   crossings in generated diagrams were never a placement problem at all: they came

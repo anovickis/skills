@@ -44,6 +44,13 @@ PAD = 12
 ARROW = 8
 LANE = 8           # spacing between parallel runs in a corridor
 FAN_MIN = 10       # smallest spacing between two wire-ends fanned out on one side
+# Wire classes. A hierarchy diagram is unreadable in one colour once interrupts and
+# clock/reset wiring are in it: they are not part of the datapath and should not have
+# to be traced to be dismissed. Four is the whole vocabulary on purpose -- one more and
+# the reader is consulting the legend instead of reading the picture.
+EDGE_CLASSES = {"data": BLUE, "control": "#B8860B", "clock": "#6A5ACD",
+                "interrupt": "#A03030"}
+CLASS_ORDER = ("data", "control", "clock", "interrupt")
 # line weight encodes cardinality (THREE tiers only):
 #   signal = one wire (1 px) · bus = a little wider · fat = a fat bus (much wider)
 WEIGHTS = {"signal": 1.0, "bus": 3.0, "fat": 6.0, "wide": 6.0}  # "wide" = alias of fat
@@ -188,7 +195,7 @@ class _Box:
 class _Edge:
     lpos = None                      # label position, chosen by Diagram._place_labels
 
-    def __init__(self, src, dst, label, src_side, dst_side, shape, weight):
+    def __init__(self, src, dst, label, src_side, dst_side, shape, weight, cls="data"):
         self.src, self.src_port = self._split(src)
         self.dst, self.dst_port = self._split(dst)
         self.label = label
@@ -196,6 +203,8 @@ class _Edge:
         self.shape = shape          # "ortho" (default) | "straight" (diagonal ok)
         # weight = line thickness: "signal" | "bus" | "wide", or a number (px)
         self.weight = WEIGHTS.get(weight, weight) if isinstance(weight, str) else float(weight)
+        self.cls = cls if cls in EDGE_CLASSES else "data"
+        self.color = EDGE_CLASSES[self.cls]
         self.pts = []
 
     @staticmethod
@@ -232,8 +241,11 @@ class Diagram:
         return b
 
     def edge(self, src, dst, label=None, src_side=None, dst_side=None,
-             shape="ortho", weight="signal"):
-        self.edges.append(_Edge(src, dst, label, src_side, dst_side, shape, weight))
+             shape="ortho", weight="signal", cls="data"):
+        """cls = "data" | "control" | "clock" | "interrupt" -- colours the wire and puts
+        that class in the legend. Unknown values fall back to "data" rather than
+        inventing a colour."""
+        self.edges.append(_Edge(src, dst, label, src_side, dst_side, shape, weight, cls))
 
     # ---- autoplace (layered, aesthetic-tuned) ----------------------------
     def autoplace(self):
@@ -780,30 +792,35 @@ class Diagram:
                 buckets.setdefault(round(mid / LANE), {}) \
                        .setdefault((out, away), []).append((idx, mid))
             for bundles in buckets.values():     # one corridor's worth of turns
-                n = max(len(m) for m in bundles.values())
-                step = LANE
-                if n > 1:                        # rather than overshoot a tight corridor
-                    room = (self.gap_x if axis == "v" else self.gap_y) / 2 - 4
-                    step = min(LANE, max(2.0, room / n))
+                # Every wire in the corridor gets its own lane, so the spacing has to fit
+                # the WHOLE bundle across the corridor -- sized per direction it would
+                # overshoot the far column and run into the boxes there.
+                n = sum(len(m) for m in bundles.values())
+                room = (self.gap_x if axis == "v" else self.gap_y) - 12
+                step = min(LANE, max(2.0, room / max(n, 1)))
                 taken = {}                       # lane x -> stretches already run on it
                 # biggest bundle first, so the main comb gets the inner lanes and the
                 # odd wire against the flow is the one pushed out
                 for (out, away), mem in sorted(bundles.items(), key=lambda kv: -len(kv[1])):
                     mem.sort(key=lambda m: -away * ends[m[0]][1][k])   # farthest first
                     for rank_i, (idx, mid) in enumerate(mem):
-                        sp, dp = ends[idx]
-                        lo, hi = sorted((sp[k], dp[k]))
-                        lo, hi = lo - 3, hi + 3  # a hair of daylight between parallel runs
-                        # start half a lane off the corridor centre, on this side: two
-                        # wires entering the same gap from opposite sides would otherwise
-                        # both claim the centre line and be drawn on top of each other
+                        # ONE LANE, ONE WIRE. Two wires can be given the same lane
+                        # position when the stretches they run along do not overlap --
+                        # and it looks wrong: collinear runs with a gap between them read
+                        # as a single long wire with the other wires' turns crossing it.
+                        # A lane is claimed outright, and the corridor was sized for the
+                        # whole bundle, so there is room.
+                        # Lane 0 sits one step off this wire's own box, and the comb
+                        # grows across the corridor towards the far column. (Starting at
+                        # the corridor CENTRE only left half the gap for the bundle.)
+                        base = ends[idx][0][j] + out * step
                         extra = 0
                         while True:
-                            x = mid + (out * step / 2) + (rank_i + extra) * step * out
-                            if all(hi <= a or lo >= b for a, b in taken.get(round(x, 1), ())):
+                            x = base + (rank_i + extra) * step * out
+                            if round(x, 1) not in taken:
                                 break
                             extra += 1
-                        taken.setdefault(round(x, 1), []).append((lo, hi))
+                        taken[round(x, 1)] = idx
                         lane_of[idx] = x
 
         # Return channels (both ends leaving the same side) are stacked outside the
@@ -921,6 +938,9 @@ class Diagram:
         placed = []
         self._label_unplaced = []
         obstacles = [(b.x, b.y, b.right, b.bottom) for b in self.boxes.values()]
+        _, legend_box = self._legend()
+        if legend_box:
+            obstacles.append(legend_box)
         for e in self.edges:
             e.lpos = None
         for e in sorted((e for e in self.edges if e.label),
@@ -962,6 +982,36 @@ class Diagram:
                 placed.append(rect(cands[0]))
                 self._label_unplaced.append(e)
 
+    def _legend(self):
+        """Swatch + name for each wire class actually used, top right on the title row.
+
+        Only the classes present: a legend entry for a colour that is not in the picture
+        is noise, and four fixed entries would be a lie on a diagram that is all data.
+        It returns the rectangle it occupies as well, because the label placer has to
+        treat it as something to keep off -- an unreadable legend is worse than none."""
+        used = [c for c in CLASS_ORDER if any(e.cls == c for e in self.edges)]
+        if len(used) < 2:                      # one colour needs no key
+            return [], None
+        sw, gap, pad = 14, 6, 16               # swatch, swatch-to-text, item-to-item
+        items, total = [], 0
+        for c in used:
+            w = sw + gap + _tw(c, FS_SMALL)
+            items.append((c, w))
+            total += w + pad
+        total -= pad
+        x = self.W - self.margin - total
+        y = 18
+        title_w = _tw(self.title, 15, bold=True)
+        if x < self.margin + title_w + pad:    # would sit on the title: drop a line
+            y = self.title_h + 4
+            x = max(self.margin, self.W - self.margin - total)
+        out = []
+        for c, w in items:
+            out.append((c, x, y))
+            x += w + pad
+        return out, (self.W - self.margin - total - 4, y - FS_SMALL - 2,
+                     self.W - self.margin, y + 4)
+
     def _build(self):
         """Lay out, route, place labels -- widening the layout until they fit.
 
@@ -996,23 +1046,29 @@ class Diagram:
              f'height="{self.H:.0f}" viewBox="0 0 {self.W:.0f} {self.H:.0f}" font-family="Arial">']
         # one arrowhead marker per distinct line weight; head scales modestly
         # with weight (markerUnits=userSpaceOnUse so it does NOT blow up with it)
-        weights = sorted({e.weight for e in self.edges})
+        heads = sorted({(e.weight, e.color) for e in self.edges})
         defs = ['<defs>']
-        for w in weights:
+        for w, colr in heads:
             h = ARROW + w                      # modest growth, not linear-with-stroke
             defs.append(
-                f'<marker id="arr{_wkey(w)}" markerUnits="userSpaceOnUse" '
+                f'<marker id="{_hkey(w, colr)}" markerUnits="userSpaceOnUse" '
                 f'markerWidth="{h:.1f}" markerHeight="{h:.1f}" refX="{h-1:.1f}" '
                 f'refY="{h/2:.1f}" orient="auto">'
-                f'<path d="M0,0 L{h-2:.1f},{h/2:.1f} L0,{h-2:.1f} Z" fill="{BLUE}"/></marker>')
+                f'<path d="M0,0 L{h-2:.1f},{h/2:.1f} L0,{h-2:.1f} Z" fill="{colr}"/></marker>')
         defs.append('</defs>')
         o.append("".join(defs))
         o.append(f'<text x="{self.margin}" y="22" fill="{BLUE}" font-size="15" '
                  f'font-weight="bold">{_esc(self.title)}</text>')
+        for cls, lx, ly in self._legend()[0]:
+            o.append(f'<line x1="{lx:.0f}" y1="{ly:.0f}" x2="{lx+14:.0f}" y2="{ly:.0f}" '
+                     f'stroke="{EDGE_CLASSES[cls]}" stroke-width="3"/>')
+            o.append(f'<text x="{lx+20:.0f}" y="{ly+3.5:.0f}" fill="{GREY}" '
+                     f'font-size="{FS_SMALL}">{_esc(cls)}</text>')
         for e in self.edges:
             pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in e.pts)
-            o.append(f'<polyline points="{pts}" fill="none" stroke="{BLUE}" '
-                     f'stroke-width="{e.weight:.1f}" marker-end="url(#arr{_wkey(e.weight)})"/>')
+            o.append(f'<polyline points="{pts}" fill="none" stroke="{e.color}" '
+                     f'stroke-width="{e.weight:.1f}" '
+                     f'marker-end="url(#{_hkey(e.weight, e.color)})"/>')
             if e.label:
                 lx, ly, anc = e.lpos
                 # painted halo-first, so a label that has to sit over a wire is still
@@ -1131,6 +1187,15 @@ class Diagram:
                 if _rect_hit(r, (b.x, b.y, b.right, b.bottom)):
                     rep.append(("WARN", f"label {e.label!r} sits on box {b.id} — "
                                 f"widen the corridor (gap_x) or shorten the label"))
+        # the legend must not land on a box or on the title
+        lg, lbox = self._legend()
+        if lbox:
+            for b in bs:
+                if _rect_hit(lbox, (b.x, b.y, b.right, b.bottom)):
+                    rep.append(("WARN", f"legend sits on box {b.id} — shorten the title "
+                                        f"or give the figure more width"))
+            if lbox[0] < self.margin + _tw(self.title, 15, bold=True) + 8 and lbox[1] < 26:
+                rep.append(("WARN", "legend runs into the title — shorten the title"))
         # aesthetic advisories (not failures)
         nx = self._crossings()
         if nx:
@@ -1191,6 +1256,11 @@ def _stacked(s1, s2):
     if abs(ax1 - ax2) < 1 and abs(bx1 - bx2) < 1 and abs(ax1 - bx1) < 3:
         return max(min(ay1, ay2), min(by1, by2)) < min(max(ay1, ay2), max(by1, by2)) - 2
     return False
+
+
+def _hkey(w, colr):
+    """Marker id for one (weight, colour): an arrowhead has to match its own wire."""
+    return "arr%s_%s" % (_wkey(w), colr.lstrip("#"))
 
 
 def _wkey(w):
@@ -1396,6 +1466,42 @@ def _selftest():
     check("manual placement is left alone (lint reports instead)",
           d18.boxes["j"].row == 0 and d18.nrow == 1 and
           any("crosses box" in m for l, m in d18.lint() if l == "FAIL"))
+
+
+    # ---- wire classes + legend (0.4.0) ------------------------------------------
+    d19 = Diagram("classes", cols=2, rows=4)
+    for r, c in enumerate(CLASS_ORDER):
+        d19.box(f"x{r}", 0, r, c.upper()); d19.box(f"y{r}", 1, r, c)
+        d19.edge(f"x{r}", f"y{r}", label=c, cls=c, weight="bus")
+    svg19 = d19._svg()
+    check("classes: each wire drawn in its own colour",
+          all(f'stroke="{EDGE_CLASSES[c]}"' in svg19 for c in CLASS_ORDER))
+    check("classes: arrowhead matches its wire's colour",
+          all(f'fill="{EDGE_CLASSES[c]}"/></marker>' in svg19 for c in CLASS_ORDER))
+    check("legend: one entry per class used",
+          all(f'>{c}</text>' in svg19 for c in CLASS_ORDER))
+    check("legend: no FAILs, nothing sitting on it",
+          not any(l == "FAIL" for l, _ in d19.lint()) and
+          not any("legend sits" in m for l, m in d19.lint()))
+
+    d20 = Diagram("one class", cols=2, rows=1)
+    d20.box("p", 0, 0, "P"); d20.box("q", 1, 0, "Q"); d20.edge("p", "q", cls="data")
+    check("legend: omitted when only one class is used", ">data</text>" not in d20._svg())
+    d21 = Diagram("t", cols=2, rows=1)
+    d21.box("p", 0, 0, "P"); d21.box("q", 1, 0, "Q")
+    d21.edge("p", "q", cls="not_a_class")
+    check("classes: an unknown class falls back to data, no invented colour",
+          d21.edges[0].cls == "data" and d21.edges[0].color == EDGE_CLASSES["data"])
+
+    # one lane, one wire: no two wires may share a lane position in a corridor
+    d22 = Diagram("lanes")
+    d22.node("root", "Root")
+    for i in range(9):
+        d22.node(f"z{i}", f"Z{i}")
+        d22.edge("root", f"z{i}", weight="bus")
+    d22._build()
+    turns = [round(e.pts[1][0], 1) for e in d22.edges if len(e.pts) > 2]
+    check("lanes: every wire turns on its own line", len(set(turns)) == len(turns))
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

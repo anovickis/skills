@@ -1,5 +1,21 @@
 # Changelog — `blockdiagram` skill
 
+## 0.4.0 — wire classes, and one lane per wire
+- **Wire classes are back**: `edge(..., cls="data"|"control"|"clock"|"interrupt")` draws
+  in `#1F4E79` / `#B8860B` / `#6A5ACD` / `#A03030` with the arrowhead matched to its own
+  wire, and a **legend** top-right for the classes present — dropped to its own line if
+  it would run into the title, treated as an obstacle by the label placer, and checked
+  by the lint. Two or more classes to earn a legend; an unknown class falls back to
+  `data` instead of inventing a colour. The bridge classifies from the signal name
+  (interrupt / clock+reset / control / data), so an uncoloured diagram means "names not
+  extracted", the same reading as an unlabelled arrow.
+- **One lane, one wire.** Lane positions were shared between wires whose stretches did
+  not overlap. It measures as zero crossings and still looks wrong: two collinear runs
+  with a gap between them read as one long wire that everything else crosses — which is
+  exactly what a reader reported on a 9-wire fan that the metric called clean. A lane is
+  now claimed outright; the corridor is sized for the whole bundle and the comb is
+  anchored one step off the box instead of at the corridor centre, so it has the room.
+
 ## 0.3.0 — crossings
 Measured on a corpus of eight real RTL-hierarchy diagrams (4–21 boxes, 98 wires):
 **180 wire crossings and 20 lint FAILs before, 0 and 0 after**, plus 14 label

@@ -1,13 +1,14 @@
 ---
 name: blockdiagram
-version: 0.3.0
+version: 0.4.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
   and computed orthogonal routing.
   Boxes auto-fit their text; arrows anchor at box edges and parallel runs are
   pushed into separate lanes; arrowheads stay small; bus edges carry width/
-  bandwidth labels; Cadence/3rd-party IP renders as grey dashed black boxes.
+  bandwidth labels; wires are coloured by class (data/control/clock/interrupt) with a
+  legend; Cadence/3rd-party IP renders as grey dashed black boxes.
   Every build renders a PNG (inkscape) and runs geometric lint (box overlap,
   text overflow, stacked parallel lines, arrowhead size, non-Arial-safe glyphs).
   Use when asked to make/draw/update a block diagram, architecture diagram, or
@@ -34,6 +35,7 @@ d.box("hub", 1, 0, "Interconnect", ["Xbar"], rowspan=3, kind="emphasis")  # blue
 d.note(0, 3, "Bus widths", ["TL: 64-bit beat", "Mem: 512-bit ×4ch"], colspan=3)
 d.edge("cpu", "hub", label="TL 64b")           # arrow, optional bus label
 d.edge("hub", "mem", label="AXI4")
+d.edge("cpu", "hub", label="irq[3:0]", cls="interrupt")   # coloured + legend entry
 report = d.save("diagrams/foo.svg")                            # writes svg + png, runs lint, prints report
 ```
 
@@ -52,6 +54,12 @@ report = d.save("diagrams/foo.svg")                            # writes svg + pn
 - **Auto label spacing**: horizontal gaps widen so a bus label clears both boxes.
 - **Small arrowheads** (size 8), **house palette** (`#1F4E79` emphasis, `#cfe0f0`
   block, grey dashed IP), **bus labels** on edges.
+- **Wire classes**: `edge(..., cls="data"|"control"|"clock"|"interrupt")` →
+  `#1F4E79` / `#B8860B` / `#6A5ACD` / `#A03030`, arrowhead matched to the wire, and a
+  legend drawn top-right for the classes actually used (two or more; one class needs no
+  key). An unknown `cls` falls back to `data` rather than inventing a colour. Interrupt
+  and clock/reset wiring is not datapath — colouring it means a reader can dismiss it
+  without tracing it. Four classes is the whole vocabulary on purpose.
 - **Measured text**: boxes size to real font metrics (PIL + Arial-metric font),
   with a heuristic fallback; glyph coverage checked against the actual font.
 
@@ -62,7 +70,8 @@ report = d.save("diagrams/foo.svg")                            # writes svg + pn
 - `WARN`: **wire crossings** (counted geometrically, from the routed polylines —
   see below); a label overlapping another label or sitting on a box; text
   overflows a box (measured); glyph missing from the font (avoid missing-glyph
-  boxes — stick to covered glyphs or convert text to paths); thin aspect ratio.
+  boxes — stick to covered glyphs or convert text to paths); a legend sitting on a box
+  or running into the title; thin aspect ratio.
 
 **The crossing count is measured, not estimated.** It intersects the routed wires,
 so it reports what a reader sees. (It used to count pairs of edges between the same
@@ -80,8 +89,11 @@ Run the engine self-test with `python3 scripts/blockdiagram.py --selftest`.
 These were all defects; they are now engine behaviour, so don't hand-fix them:
 - **Lane order in a bundle.** Wires turning in one corridor are ordered by how far
   they travel — farthest destination innermost — so a fan-out draws as a comb
-  instead of self-crossing. Lanes are also packed per corridor position, so two
-  wires entering the same gap from opposite sides never land on one line.
+  instead of self-crossing.
+- **One lane, one wire.** No two wires share a turn line, even where the stretches
+  they run along don't overlap: collinear runs with a gap between them read as a
+  single long wire with the other wires' turns crossing it. The corridor is sized for
+  the whole bundle and the comb starts one step off the box.
 - **A side is sized to its fan.** A box that must host *n* wires on one side grows
   so the ends stay `FAN_MIN` apart, claiming the empty cells beside it (rowspan)
   rather than inflating its whole grid row.
