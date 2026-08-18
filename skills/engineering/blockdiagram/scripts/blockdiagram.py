@@ -486,7 +486,8 @@ class Diagram:
                     default = sp[0] + (self.gap_x / 2 if ss == "R" else -self.gap_x / 2)
                     e.pts = self._ortho_route(sp, dp, default, {s.id, d.id},
                                               1 if ss == "R" else -1,
-                                              _arrow_len(e.weight) + 2)
+                                              _arrow_len(e.weight) + 2,
+                                              _tw(e.label, FS_SMALL) if e.label else 0)
                     continue                       # _ortho_route records its own path
             elif (ss in "TB" and ds in "TB" and abs(sp[0] - dp[0]) < 1
                   and not any(_seg_in_box((sp, dp), b) for b in self.boxes.values())):
@@ -824,7 +825,7 @@ class Diagram:
     def _hgaps(self):
         return [(a + b) / 2 for a, b in self._hgap_spans()]
 
-    def _ortho_route(self, sp, dp, default, skip_ids, sign, need=0):
+    def _ortho_route(self, sp, dp, default, skip_ids, sign, need=0, label_w=0):
         """An orthogonal path from sp to dp that shares no ground with anything else.
 
         Three hard rules, in order. A path that breaks one is not drawn:
@@ -850,15 +851,25 @@ class Diagram:
         uh, uv = self._used_h, self._used_v
 
         def ok_and_cost(pts):
-            """(crossings, length) for a legal path, or None if it breaks a rule."""
+            """(crossings, label-homeless, length) for a legal path, else None.
+
+            `label-homeless` is why a wire could end up unnamed. gap_x is sized so a
+            label fits the WHOLE gap between two columns -- but a 3-segment route
+            splits that gap into two half-runs, and a name that fits the gap fits
+            neither half. Rather than double every gap and bloat the drawing, the
+            router prefers, among paths that cross equally little, one that gives its
+            own label somewhere to sit.
+            """
             cross = 0
             total = 0
+            longest_h = 0
             for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
                 if x1 == x2 and y1 == y2:
                     continue
                 total += abs(x2 - x1) + abs(y2 - y1)
                 if y1 == y2:                                   # horizontal
                     xa, xb = (x1, x2) if x1 < x2 else (x2, x1)
+                    longest_h = max(longest_h, xb - xa)
                     for bx0, by0, bx1, by1 in boxes:
                         if xa < bx1 - 1 and xb > bx0 + 1 and by0 + 1 < y1 < by1 - 1:
                             return None
@@ -896,7 +907,7 @@ class Diagram:
                 for oj in range(oi + 2, len(own)):
                     if _crosses(own[oi], own[oj]) or _stacked(own[oi], own[oj]):
                         return None
-            return cross, total
+            return cross, (1 if label_w and longest_h < label_w else 0), total
 
         best = None
         vt = self._tracks(self._vgap_spans(), default)
@@ -904,6 +915,8 @@ class Diagram:
             c = ok_and_cost([sp, (mx, sp[1]), (mx, dp[1]), dp])
             if c and (best is None or (c, 2) < best[0]):
                 best = ((c, 2), [sp, (mx, sp[1]), (mx, dp[1]), dp])
+                if c[0] == 0 and c[1] == 0:
+                    break                     # clean, and its name has a home
         if best is None or best[0][0][0] > 0:
             # Five segments: out to a track, along a horizontal band, in. Needed when
             # the target is several columns away -- the 3-segment form's last run has
@@ -919,7 +932,7 @@ class Diagram:
                         c = ok_and_cost(pts)
                         if c and (best is None or (c, 4) < best[0]):
                             best = ((c, 4), pts)
-                            if c[0] == 0:
+                            if c[0] == 0 and c[1] == 0:
                                 done = True
                                 break
                     if done:
@@ -1084,6 +1097,14 @@ class Diagram:
         if any(_dist_to_pts((cx, cy), p) < mine + 8 for p in others):
             return None
         return bb, cx, cy
+
+    def _label_spots_dry(self, e):
+        """Could this wire's name be placed at all? Does not consume a slot."""
+        keep = list(self._lbl_boxes) if hasattr(self, "_lbl_boxes") else []
+        self._lbl_boxes = list(keep)
+        got = self._label_spots(e, 1)
+        self._lbl_boxes = keep
+        return bool(got)
 
     def _label_spots(self, e, want):
         """Find up to `want` places on this wire where its name can actually be read.
@@ -1274,6 +1295,37 @@ class Diagram:
                                 f"{eb.src}->{eb.dst} overlap in one corridor — fix: remove the "
                                 f"duplicate edge, give them distinct src_side/dst_side, or "
                                 f"route one through an intermediate box"))
+        # Rules the ROUTER enforces are checked again HERE, on the finished geometry.
+        # A rule enforced only where it is generated is a rule that regresses silently:
+        # the router simply stops producing the good case and nothing says so. Checking
+        # the output closes that loop, and costs one pass over the segments.
+        for e in self.edges:
+            own = [sg for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+            for i in range(len(own)):
+                for j in range(i + 2, len(own)):
+                    if _crosses(own[i], own[j]) or _stacked(own[i], own[j]):
+                        rep.append(("FAIL", f"wire loops over itself: {e.src}->{e.dst} "
+                                    f"— fix: give it an explicit src_side/dst_side, or "
+                                    f"move one of the two boxes"))
+                        break
+            if len(e.pts) >= 2 and e.shape != "straight":
+                if _seg_len((e.pts[-2], e.pts[-1])) < _arrow_len(e.weight):
+                    rep.append(("FAIL", f"arrowhead entered from the side: "
+                                f"{e.src}->{e.dst} — its final run is shorter than the "
+                                f"head, so the corner falls inside the triangle"))
+                sb, db = self.boxes[e.src], self.boxes[e.dst]
+                if not e.src_side and not e.src_port and abs(e.pts[0][0] - sb.right) > 0.5:
+                    rep.append(("WARN", f"output not leaving the right edge: "
+                                f"{e.src}->{e.dst}"))
+                if not e.dst_side and not e.dst_port and abs(e.pts[-1][0] - db.x) > 0.5:
+                    rep.append(("WARN", f"input not arriving on the left edge: "
+                                f"{e.src}->{e.dst}"))
+        # a wire label that cannot be read is a wire without a name
+        for e in self.edges:
+            if e.label and not self._label_spots_dry(e):
+                rep.append(("WARN", f"no legible place for the name of "
+                            f"{e.src}->{e.dst} ({e.label!r}) — the wire is drawn "
+                            f"unnamed; fewer boxes or more spacing would fix it"))
         # glyphs missing from the font
         M = _Metrics.get()
         seen = set()

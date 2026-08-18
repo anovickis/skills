@@ -1,5 +1,18 @@
 # Changelog — `blockdiagram` skill
 
+## 0.5.1
+- **The router now gives every label somewhere to sit.** `gap_x` was sized so a name
+  fits the whole gap between two columns, but a 3-segment route splits that gap into two
+  half-runs, and a name that fits the gap fits neither half — which is why wires came out
+  unnamed. Among paths that cross equally little, the router now prefers one whose
+  longest horizontal run can actually hold the label. 72 → 81 of 85 connections carry a
+  readable name and width, and four of the eight samples round-trip completely.
+- **`lint()` checks the rules on the finished geometry**, not only where they are
+  generated: self-crossing wires, arrowheads entered from the side, the left/right flow
+  convention, and any wire whose name could not be placed (naming the wire and saying
+  why). A rule enforced only at the point of generation regresses silently — the router
+  just stops producing the good case and nothing says so.
+
 ## 0.5.0
 - **The crossing ladder is complete**: reorder exits, reorder entrances, *move the
   modules* (swap a pair, change a row, change a column), route the wire differently,
