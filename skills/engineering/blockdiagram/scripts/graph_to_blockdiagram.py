@@ -196,6 +196,29 @@ def _weight_for(edge, node):
     return "fat" if b >= 256 else "bus" if b >= 32 else "signal"
 
 
+RAIL_MIN = 4        # below this, individual wires are still readable
+
+
+def _rails(edges, ports):
+    """Split the edges into (rails, wires).
+
+    A clock or reset from one source to many blocks is a global signal, and drawn as one
+    wire per block it costs a crossing per block for no information -- the reader already
+    assumes every block is clocked. Grouped into a rail it becomes a tap on each block.
+    Only groups of RAIL_MIN or more, and only when the kind says clock: three wires are
+    still worth following individually.
+    """
+    if not ports:
+        return {}, list(edges)          # kinds are unknown without port data
+    groups = {}
+    for e in edges:
+        if _kind_for(e) == "clock":
+            groups.setdefault(e["source"], []).append(e)
+    rails = {src: es for src, es in groups.items() if len(es) >= RAIL_MIN}
+    railed = {id(e) for es in rails.values() for e in es}
+    return rails, [e for e in edges if id(e) not in railed]
+
+
 def _kind_for(edge):
     """Group a wire by what it CARRIES, from the name of its widest signal.
 
@@ -263,10 +286,16 @@ def emit_dsl(title, keep, kept_edges, nodes, label_edges, ports=False):
         desc = _port_desc(n)
         lines.append(f'd.node({_safe(nid)!r}, {n.get("label", nid)!r}, {desc!r}, kind={kind!r})')
     lines.append("")
-    for e in kept_edges:
+    rails, wires = _rails(kept_edges, ports)
+    for e in wires:
         w = _weight_for(e, nodes.get(e["target"])) if ports else "signal"
         lines.append(f'd.edge({_safe(e["source"])!r}, {_safe(e["target"])!r}, '
                      f'label={_edge_label(e, label_edges, ports)!r}, weight={w!r})')
+    for src, es in rails.items():
+        tgts = [_safe(e["target"]) for e in es]
+        lines.append(f'd.rail({_safe(src)!r}, {tgts!r}, '
+                     f'label={_edge_label(es[0], label_edges, ports) or "clk/rst"!r}, '
+                     f'kind="clock")')
     lines += ["", 'print(d.save("diagram.svg"))']
     return "\n".join(lines)
 
@@ -280,6 +309,8 @@ def main():
     ap.add_argument("--modules", nargs="+", help="explicit module names instead of --root")
     ap.add_argument("-o", "--out", default="diagram.svg", help="output SVG (a PNG is written beside it)")
     ap.add_argument("--emit-dsl", action="store_true", help="print the DSL instead of rendering")
+    ap.add_argument("--no-rails", action="store_true",
+                    help="draw clock/reset as individual wires instead of a tap per block")
     ap.add_argument("--label-edges", action="store_true", help="label arrows 'instantiates'")
     ap.add_argument("--ports", action="store_true",
                     help="show each block's interface (port counts + widest bus) and scale "
@@ -349,11 +380,19 @@ def main():
         desc = _port_desc(n)
         d.node(_safe(nid), n.get("label", nid), desc,
                kind="ip" if n.get("external") else "block")
-    for e in kept_edges:
+    rails, wires = _rails(kept_edges, a.ports) if not a.no_rails else ({}, kept_edges)
+    for e in wires:
         d.edge(_safe(e["source"]), _safe(e["target"]),
                label=_edge_label(e, a.label_edges, a.ports),
                weight=_weight_for(e, nodes.get(e["target"])) if a.ports else "signal",
                kind=_kind_for(e) if a.ports else "data")
+    for src, es in rails.items():
+        d.rail(_safe(src), [_safe(e["target"]) for e in es],
+               label=_edge_label(es[0], a.label_edges, a.ports) or "clk/rst",
+               kind="clock")
+    if rails:
+        print(f"drawn as rails (a tap per block, not a wire per block): "
+              + ", ".join(f"{src} x{len(es)}" for src, es in rails.items()))
     report = d.save(a.out)
     print(report)
     if a.verify:

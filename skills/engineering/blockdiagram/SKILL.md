@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.2.0
+version: 0.6.0
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -39,9 +39,12 @@ What a correct diagram obeys. The engine enforces these; the self-test asserts t
 10. Colour groups wires by what they carry (data / control / clock / interrupt), with a
     legend whenever more than one kind is present. Unrecognised stays `data` — a wire in
     the wrong colour is worse than one in the default.
+11. A **global** signal is a tap, not a wire per block. Clock, reset and scan go to
+    everything; drawn as N long wires they cost a crossing per block and tell the reader
+    nothing they had not assumed. Use `rail()` — see below.
 
 **Blocks**
-11. Inputs arrive on the LEFT, outputs leave on the RIGHT. A feedback path leaves the
+12. Inputs arrive on the LEFT, outputs leave on the RIGHT. A feedback path leaves the
     right edge, goes round, and re-enters the left. Bidirectional links may use either
     side, set explicitly.
 12. Size a block from the wires entering and leaving it, so there is room to label them.
@@ -154,6 +157,41 @@ balance. To hand-tune, call `d.autoplace()` explicitly, then override any box:
 re-run autoplace once every box has a position). Mixing positioned `box()` and
 positionless `node()` is not supported — autoplace reassigns every box; go all
 manual or all auto (+ post-tune).
+
+## Global signals: `rail()`
+```python
+d.rail("clkgen", ["core0", "core1", "l2", "uart"], label="clk/rst", kind="clock")
+```
+One **tap** per block instead of one wire per block: a short stub on each target, the
+source named once. Clock and reset across five levels of hierarchy measured in the
+*hundreds* of crossings drawn as wires, and no router can help — those wires genuinely do
+go everywhere. A spec does not draw them either. `O(1)` ink per block, nothing to cross,
+and the relationship stays in the source (`src` is carried on every tap, so
+`verify_diagram.py` can still account for it). Taps take no part in ranking or placement.
+
+The graph bridge does this automatically: a clock-kind fan of 4 or more from one source
+becomes a rail, and it prints which ones it grouped. `--no-rails` draws them as wires.
+
+## Feedback and cycles
+Cycles are broken *before* ranking (depth-first back-edge detection), so a loop cannot
+reverse the flow — a fetch/decode/exec/wb pipeline with a `redirect` used to come out
+with `exec` at column 0, left of `fetch`, because the longest path ran round the loop.
+The back edges are then drawn as what they are, obeying rule 11: out of the right edge,
+round, and back in on the left. `d._back_edges` holds them after `autoplace()`.
+
+## Depth
+Containment depth is close to free: a tree draws with **no crossings at any depth**,
+provided each parent's children stay together — which is why the ordering sweeps run one
+side at a time (forward by parents, backward by children) rather than averaging both, and
+why wrapping a wide rank breaks on **family boundaries** instead of every `cap` boxes. A
+parent whose children straddle two columns has to send wires into both, and those wires
+cross the other column's.
+
+What costs crossings is *cross-level dataflow* mixed into the same figure: a refill path
+from a leaf back to a shared cache, interrupts from the periphery to the cores. Measured
+on one 48-box figure: 0 crossings with containment alone, 12 with 4 such wires, 105 with
+10. If a figure needs both, use `rail()` for anything global, split the relations into
+separate figures, or accept the crossings — the lint counts them for you.
 
 ## Placement intent
 The grid is a mechanism, not the look. Place related boxes in adjacent cells and

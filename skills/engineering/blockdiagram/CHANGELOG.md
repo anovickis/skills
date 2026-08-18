@@ -1,5 +1,42 @@
 # Changelog — `blockdiagram` skill
 
+## 0.6.0 — cycles, families, and rails
+Ported from a parallel line of work on the same engine, each change measured against the
+same eight-diagram sample set (77 crossings before, 77 after — see below for what moved
+and what did not).
+
+- **Cycles are broken before ranking.** Ranking straight through a feedback loop reversed
+  the flow: a fetch/decode/exec/wb pipeline with a `redirect` came out with `exec` at
+  column 0, LEFT of `fetch`, because the longest path ran round the loop. Back edges are
+  found depth-first, ranking uses the DAG that is left, and the loop is then drawn as the
+  flow convention already says it should be — out the right, round, back in the left.
+  Pipeline columns: `[1, 2, 0, 1]` → `[0, 1, 2, 3]`.
+- **`rail(src, dsts, ...)` — a global signal is a tap per block, not a wire per block.**
+  Clock and reset across five levels of hierarchy measured in the *hundreds* of crossings
+  as wires, and no router can help: those wires genuinely do go everywhere. A spec draws a
+  tap at each block and names the source once. Taps take no part in ranking or placement.
+  A tap's far end sits off the block deliberately, so **the stub carries `data-tap` with
+  its source** and `verify_diagram.py` attributes it — a 5-tap rail round-trips with zero
+  problems, where otherwise every tap would have read as a wire ending in space. The graph
+  bridge groups a clock-kind fan of 4+ from one source into a rail automatically, printing
+  what it grouped; `--no-rails` opts out.
+- **Ordering sweeps run one side at a time**, alternating (forward by parents, backward by
+  children), instead of taking the median over both at once. Averaging both does not
+  converge: a box is pulled towards its own children while its siblings go elsewhere, and
+  in a containment tree that scattered every parent's children across their rank.
+- **Wrapping breaks on family boundaries.** Slicing a wide rank every `cap` boxes cut
+  through the middle of a parent's children, and a parent whose children straddle two
+  columns must send wires into both. On a 40-box tree: 3 of 13 families were cut, now 0,
+  and no parent's children are out of order in their column.
+
+What that bought, honestly: the tree went 27 → 25 crossings and the sample set did not
+move (77 → 77, 62.3s → 61.3s). The sample diagrams are single-parent fan-outs, where one
+family is larger than a column and family-aware wrapping has nothing to group. The
+invariant is still worth having — a reader can see which children belong to which parent —
+but the remaining crossings on a wrapped tree are the wrapping itself: a parent ends up
+several columns from its children's chunk. Fixing that needs parent-adjacent columns
+(nesting), which is a placement strategy, not an ordering rule.
+
 ## 0.5.1
 - **The router now gives every label somewhere to sit.** `gap_x` was sized so a name
   fits the whole gap between two columns, but a 3-segment route splits that gap into two

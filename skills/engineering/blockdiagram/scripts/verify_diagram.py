@@ -141,8 +141,15 @@ def recover(svg):
     """Connections as a reader would follow them: tail -> head, with name and size."""
     boxes = _boxes(svg)
     labels = _labels(svg)
-    wires = [[tuple(map(float, p.split(","))) for p in m.group(1).split()]
-             for m in re.finditer(r'<polyline points="([^"]+)"', svg)]
+    wires, taps = [], {}
+    for wi, m in enumerate(re.finditer(r'<polyline points="([^"]+)"([^>]*)>', svg)):
+        wires.append([tuple(map(float, p.split(","))) for p in m.group(1).split()])
+        # A rail tap is a stub: its far end sits off the block on purpose, and the block
+        # it comes FROM is written on the wire. Without that this reads as a wire ending
+        # in space -- the picture would be reporting a fault that is not one.
+        t = re.search(r'data-tap="([^"]*)"', m.group(2) or "")
+        if t:
+            taps[wi] = t.group(1)
     matched = _match_labels(wires, labels)
     edges, problems = [], []
     for wi, pts in enumerate(wires):
@@ -150,6 +157,8 @@ def recover(svg):
             continue
         src, e1 = _attribute(pts[0], boxes)
         dst, e2 = _attribute(pts[-1], boxes)
+        if wi in taps:                      # a tap names its own source
+            src, e1 = taps[wi], None
         name, bits = _parse_label(matched.get(wi))
         if src and dst:
             edges.append((src, dst, name, bits))

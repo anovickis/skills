@@ -49,6 +49,7 @@ WEIGHTS = {"signal": 1.0, "bus": 3.0, "fat": 6.0, "wide": 6.0}  # "wide" = alias
 # Wire colour groups what a wire CARRIES, so a reader can pick out the control paths
 # from the data paths without reading a single label. Kept few and kept dark: colour is
 # a grouping cue here, not decoration, and a diagram with nine wire colours has none.
+TAP = 16           # length of a rail stub (a clock/reset tap into a block)
 WIRE_KINDS = {
     "data": "#1F4E79",         # house blue — payload
     "control": "#B8860B",      # amber — valid/ready, config, mode
@@ -217,6 +218,24 @@ class Diagram:
         """Add a box WITHOUT a position; autoplace() assigns (col,row)."""
         return self.box(bid, None, None, label, desc, kind, ports=ports)
 
+    def rail(self, src, dsts, label=None, kind="clock", weight="signal", side="T"):
+        """A global signal (clock, reset, scan) drawn as a TAP on each block.
+
+        Clock and reset go to everything, and drawn as one wire per block they are what
+        wrecks a deep diagram: eleven of them across five levels measured in the hundreds
+        of crossings, and no router can help, because those wires genuinely do go
+        everywhere. A spec does not draw them either -- it draws a tap at each block and
+        names the source once. That is O(1) ink per block instead of O(depth), and a stub
+        local to its own box cannot cross anything.
+
+        The relationship stays in the picture and in the diagram source (`src` is carried
+        on every tap edge, so verify_diagram can still account for it); it is simply not
+        traced across the figure. Taps take no part in ranking or placement.
+        """
+        for dst in dsts:
+            self.edges.append(_Edge(src, dst, label, side, side, "tap", weight, kind))
+        return self
+
     def note(self, col, row, title, lines, colspan=1, rowspan=1):
         b = self.box("__note_%d" % len(self.boxes), col, row, "", lines,
                      kind="note", colspan=colspan, rowspan=rowspan)
@@ -229,6 +248,33 @@ class Diagram:
         self.edges.append(_Edge(src, dst, label, src_side, dst_side, shape, weight, kind))
 
     # ---- autoplace (layered, aesthetic-tuned) ----------------------------
+    @staticmethod
+    def _find_back_edges(succ):
+        """Edges that point back into the path being walked -- the cycles, in other words.
+
+        Depth-first, iterative (a deep hierarchy would blow a recursive one), and
+        deterministic: roots are visited in insertion order, so the same graph always
+        yields the same back-edge set and the same picture."""
+        back, state = set(), {}                     # state: 0 = on stack, 1 = done
+        for root in succ:
+            if root in state:
+                continue
+            stack = [(root, iter(succ[root]))]
+            state[root] = 0
+            while stack:
+                node, it = stack[-1]
+                for nxt in it:
+                    if state.get(nxt) == 0:         # points back into the current path
+                        back.add((node, nxt))
+                    elif nxt not in state:
+                        state[nxt] = 0
+                        stack.append((nxt, iter(succ[nxt])))
+                        break
+                else:
+                    state[node] = 1
+                    stack.pop()
+        return back
+
     def autoplace(self):
         """Assign (col,row) from connectivity. Layered left-to-right flow with
         median-barycenter row ordering (few crossings, straightened chains) and
@@ -238,26 +284,43 @@ class Diagram:
         succ = {i: [] for i in ids}
         pred = {i: [] for i in ids}
         for e in self.edges:
+            if e.shape == "tap":          # local to its own box; it places nothing
+                continue
             if e.src in succ and e.dst in pred and e.src != e.dst:
                 succ[e.src].append(e.dst)
                 pred[e.dst].append(e.src)
-        # 1. rank = longest path from sources (bounded so cycles can't hang)
+        # 1. break the cycles BEFORE ranking. A feedback wire is a fact of hardware --
+        # redirect, stall, retry, credit return -- and ranking straight through one puts
+        # the loop's boxes in the wrong order: a fetch/decode/exec/wb pipeline with a
+        # redirect came out with exec at column 0, LEFT of fetch, because the longest
+        # path ran round the loop. Find the back edges with a depth-first walk, rank on
+        # the DAG that is left, and let the back edges be drawn as what they are: wires
+        # running against the flow, which the flow convention already handles.
+        self._back_edges = back = self._find_back_edges(succ)
+        fpred = {i: [x for x in pred[i] if (x, i) not in back] for i in ids}
+        fsucc = {i: [x for x in succ[i] if (i, x) not in back] for i in ids}
+
+        # rank = longest path from sources over the forward edges
         rank = {i: 0 for i in ids}
         for _ in range(len(ids) + 1):
             changed = False
             for e in self.edges:
+                if (e.src, e.dst) in back or e.src == e.dst or e.shape == "tap":
+                    continue
                 if e.src in rank and e.dst in rank and rank[e.dst] < rank[e.src] + 1:
                     rank[e.dst] = rank[e.src] + 1
                     changed = True
             if not changed:
                 break
         # tighten: pull a pure source (no predecessors) rightward to just before
-        # its nearest consumer, so its edges span one rank and don't cross boxes
+        # its nearest consumer, so its edges span one rank and don't cross boxes.
+        # "Pure source" counts forward edges only -- a box fed solely by a feedback
+        # wire is still a source of the flow, and treating it as fed pinned it left.
         for _ in range(len(ids) + 1):
             moved = False
             for i in ids:
-                if not pred[i] and succ[i]:
-                    r = min(rank[s] for s in succ[i]) - 1
+                if not fpred[i] and fsucc[i]:
+                    r = min(rank[s] for s in fsucc[i]) - 1
                     if r > rank[i]:
                         rank[i] = r
                         moved = True
@@ -269,19 +332,57 @@ class Diagram:
         maxr = max(rank.values(), default=0)
         pos = {i: float(k) for r in ranks for k, i in enumerate(ranks[r])}
 
-        # 2. ordering sweeps: median barycenter over both neighbour sides
-        def bary(i):
-            ns = pred[i] + succ[i]
+        # 2. ordering sweeps, ONE SIDE AT A TIME, alternating: forward by parents,
+        # backward by children. Taking the median over both sides at once does not
+        # converge -- a box is pulled towards its own children while its siblings are
+        # pulled elsewhere -- and in a plain containment tree that scattered every
+        # parent's children across their rank: 27 crossings on a 40-box tree that is
+        # drawable with none. A forward sweep groups each parent's children by
+        # construction, which also matters for the wrapping below, since a chunk of a
+        # wide rank then holds whole sibling groups instead of parts of three.
+        # The best ordering seen is kept, scored on adjacent-rank inversions (cheap;
+        # the drawn geometry is scored properly later by _optimise).
+        def bary(i, side):
+            ns = side[i]
             if not ns:
                 return pos[i]
             v = sorted(pos[n] for n in ns)
             m = len(v)
             return v[m // 2] if m % 2 else (v[m // 2 - 1] + v[m // 2]) / 2
-        for _ in range(6):
-            for r in sorted(ranks):                 # iterate populated ranks only
-                ranks[r].sort(key=bary)
+
+        def inversions():
+            n = 0
+            es = [(e.src, e.dst) for e in self.edges
+                  if e.src in rank and e.dst in rank and (e.src, e.dst) not in back]
+            for a in range(len(es)):
+                s1, d1 = es[a]
+                for b in range(a + 1, len(es)):
+                    s2, d2 = es[b]
+                    if rank[s1] != rank[s2] or rank[d1] != rank[d2]:
+                        continue
+                    if (pos[s1] - pos[s2]) * (pos[d1] - pos[d2]) < 0:
+                        n += 1
+            return n
+
+        rank_order = sorted(ranks)
+        best, best_pos = inversions(), dict(pos)
+        for it in range(8):
+            if it % 2 == 0:
+                sweep, side = rank_order[1:], fpred      # forward: follow the parents
+            else:
+                sweep, side = list(reversed(rank_order[:-1])), fsucc
+            for r in sweep:
+                ranks[r].sort(key=lambda i: bary(i, side))
                 for k, i in enumerate(ranks[r]):
                     pos[i] = float(k)
+            got = inversions()
+            if got < best:
+                best, best_pos = got, dict(pos)
+            if not best:
+                break
+        pos = best_pos
+        for r in ranks:
+            ranks[r].sort(key=lambda i: pos[i])
 
         # 3. assign cells; centre each column vertically for balance. Columns are
         # re-indexed densely so empty ranks (left by tightening) don't appear.
@@ -296,11 +397,37 @@ class Diagram:
         chunked = []                       # [(rank, [ids])] in column order
         for r in sorted(ranks):
             lst = ranks[r]
-            if len(lst) > cap:
-                for i in range(0, len(lst), cap):
-                    chunked.append((r, lst[i:i + cap]))
-            else:
+            if len(lst) <= cap:
                 chunked.append((r, lst))
+                continue
+            # WRAP ON FAMILY BOUNDARIES. Slicing a wide rank every `cap` boxes cuts
+            # through the middle of a parent's children, and a parent whose children
+            # straddle two columns has to send wires into both -- which cross the other
+            # column's wires on the way. In a 40-box tree three of thirteen parents were
+            # cut like that, and they accounted for the crossings that ordering alone
+            # could not remove. The rank is already grouped by parent (the sweeps above
+            # see to that), so the groups are consecutive runs: pack whole runs into
+            # columns, and only split a run that is bigger than a column on its own.
+            runs = []
+            for i in lst:
+                key = tuple(sorted(fpred[i]))
+                if runs and runs[-1][0] == key:
+                    runs[-1][1].append(i)
+                else:
+                    runs.append((key, [i]))
+            cur = []
+            for _, run in runs:
+                if len(run) > cap:         # one parent with more children than a column
+                    if cur:
+                        chunked.append((r, cur)); cur = []
+                    for i in range(0, len(run), cap):
+                        chunked.append((r, run[i:i + cap]))
+                    continue
+                if cur and len(cur) + len(run) > cap:
+                    chunked.append((r, cur)); cur = []
+                cur.extend(run)
+            if cur:
+                chunked.append((r, cur))
         nrow = max((len(c) for _, c in chunked), default=1)
         for col, (_, lst) in enumerate(chunked):
             off = (nrow - len(lst)) // 2
@@ -377,7 +504,7 @@ class Diagram:
         # leave at distinct points (a single edge stays centred / aligned).
         groups = self._groups = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            if not e.src_port:
+            if not e.src_port and e.shape != "tap":
                 groups.setdefault((s.id, ss), []).append((idx, "s"))
             if not e.dst_port:
                 groups.setdefault((d.id, ds), []).append((idx, "d"))
@@ -455,8 +582,12 @@ class Diagram:
         self._box_rects = [(b.x, b.y, b.right, b.bottom) for b in self.boxes.values()]
         ends = {}
         for idx, (e, s, d, ss, ds) in enumerate(info):
-            ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
-                         d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")])
+            dp = d.port_point(e.dst_port) if e.dst_port else anchor[(idx, "d")]
+            if e.shape == "tap":
+                ends[idx] = (dp, dp)      # no source anchor; the router makes the stub
+            else:
+                ends[idx] = (s.port_point(e.src_port) if e.src_port else anchor[(idx, "s")],
+                             dp)
         # Whoever routes first gets the good corridors, so routing ORDER is itself a
         # lever on crossings. Short hops go first by default (least freedom, most
         # deserve to be straight); _ripup() promotes a wire that is tangled where it
@@ -469,7 +600,12 @@ class Diagram:
         for idx in order:
             e, s, d, ss, ds = info[idx]
             sp, dp = ends[idx]
-            if e.shape == "straight":
+            if e.shape == "tap":
+                # a stub into this box's own edge, pointing inwards. Long enough that the
+                # arrowhead is entered from behind, which is the rule for every wire.
+                off = {"T": (0, -TAP), "B": (0, TAP), "L": (-TAP, 0), "R": (TAP, 0)}[ds]
+                e.pts = [(dp[0] + off[0], dp[1] + off[1]), dp]
+            elif e.shape == "straight":
                 e.pts = [sp, dp]
             elif ss in "LR" and ds in "LR":
                 # Level ends can go straight across -- but ONLY if nothing is in the
@@ -1042,8 +1178,13 @@ class Diagram:
                 lx -= 22
         for e in self.edges:
             pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in e.pts)
+            # A tap's far end is not on a box, so the picture has to say where it comes
+            # from -- otherwise reading the SVG back reports it as a wire ending in space,
+            # which is exactly the failure verify_diagram exists to catch. The source
+            # travels with the stub.
+            frm = f' data-tap="{_esc(e.src)}"' if e.shape == "tap" else ""
             o.append(f'<polyline points="{pts}" fill="none" stroke="{e.color}" '
-                     f'stroke-width="{e.weight:.1f}" '
+                     f'stroke-width="{e.weight:.1f}"{frm} '
                      f'marker-end="url(#arr{_wkey(e.weight)}{_ckey(e.color)})"/>')
             if e.label:
                 # Label the wire where it can be read. On a long run the two ends can be
@@ -1602,6 +1743,72 @@ def _selftest():
           all(f'stroke-width="{WEIGHTS[w]:.1f}"' in svg for w in ("signal", "bus", "fat")))
     check("weights: arrowhead does not scale with stroke (userSpaceOnUse)",
           'markerUnits="userSpaceOnUse"' in svg)
+
+
+    # ---- cycles, sibling order, rails -------------------------------------------
+    # A feedback wire must not reverse the flow. Ranking through the loop put exec at
+    # column 0, LEFT of fetch, because the longest path ran round the cycle.
+    d13 = Diagram("pipeline with feedback")
+    for nm in ("fetch", "decode", "exec", "wb"):
+        d13.node(nm, nm.title())
+    d13.edge("fetch", "decode", label="iq [32]")
+    d13.edge("decode", "exec", label="uop [64]")
+    d13.edge("exec", "wb", label="res [64]")
+    d13.edge("exec", "fetch", label="redirect [1]", kind="control")
+    d13.edge("wb", "decode", label="stall [1]", kind="control")
+    d13.lint()
+    cols13 = [d13.boxes[n].col for n in ("fetch", "decode", "exec", "wb")]
+    check("cycles: a feedback path does not reverse the flow", cols13 == sorted(cols13))
+    check("cycles: the back edges are the ones identified",
+          d13._back_edges == {("exec", "fetch"), ("wb", "decode")})
+
+    # A containment tree is drawable with no crossings at any depth, which needs each
+    # parent's children kept together in their rank -- and kept together they also
+    # survive the wrapping of a wide rank into columns.
+    # (two levels, 13 boxes: the invariant shows at any depth, and the gate has to
+    # stay quick -- the optimiser takes minutes on a forty-box tree)
+    d14 = Diagram("two-level tree")
+    d14.node("root", "Root", kind="emphasis")
+    q, n = ["root"], 0
+    for lvl in range(2):
+        nxt = []
+        for parent in q:
+            for k in range(3):
+                n += 1
+                bid = f"t{n}"
+                d14.node(bid, f"B{lvl}.{k}")
+                d14.edge(parent, bid, label="tl [64]", weight="bus")
+                nxt.append(bid)
+        q = nxt
+    d14.lint()
+    kids14 = {}
+    for e in d14.edges:
+        kids14.setdefault(e.src, []).append((d14.boxes[e.dst].col, d14.boxes[e.dst].row))
+    check("tree: each parent's children stay together",
+          all(len({c for c, _ in v}) == 1 and
+              sorted(r for _, r in v) == list(range(min(r for _, r in v),
+                                                   min(r for _, r in v) + len(v)))
+              for v in kids14.values()))
+
+    # A global signal is a tap per block, not a wire per block.
+    d15 = Diagram("clock rail")
+    d15.node("top", "Top", kind="emphasis")
+    d15.node("clk", "ClockSource", kind="emphasis")
+    d15.edge("top", "clk", label="tl [64]")
+    tgt = []
+    for i in range(8):
+        d15.node(f"b{i}", f"Blk{i}")
+        d15.edge("top", f"b{i}", label="tl [64]", weight="bus")
+        tgt.append(f"b{i}")
+    d15.rail("clk", tgt, label="clk/rst", kind="clock")
+    rep15 = d15.lint()
+    taps = [e for e in d15.edges if e.shape == "tap"]
+    check("rail: one tap per block", len(taps) == 8)
+    check("rail: each tap is a stub on its own block, entered from behind",
+          all(len(e.pts) == 2 and abs(e.pts[0][1] - e.pts[1][1]) == TAP for e in taps))
+    check("rail: taps introduce no FAIL",
+          not any(l == "FAIL" for l, _ in rep15))
+    check("rail: taps do not drive placement", d15.boxes["clk"].col <= d15.boxes["b0"].col)
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails
