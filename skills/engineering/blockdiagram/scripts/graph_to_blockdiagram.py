@@ -143,6 +143,7 @@ def select(nodes, edges, roots, depth, max_nodes):
     # than sixteen identical lines ever could.
     counts = {}
     widths = {}
+    names = {}
     for e in edges:
         if e.get("relation") != "instantiates":
             continue
@@ -150,9 +151,12 @@ def select(nodes, edges, roots, depth, max_nodes):
         if e["source"] in sel and e["target"] in sel:
             counts[k] = counts.get(k, 0) + 1
             w = e.get("verilog_conn_bits_max")
-            if w:
-                widths[k] = max(widths.get(k, 0), w)
-    kept_edges = [{"source": s, "target": t, "count": c, "bits": widths.get((s, t))}
+            if w and w >= widths.get(k, 0):
+                widths[k] = w
+                # the name that goes with the width being shown
+                names[k] = e.get("verilog_conn_widest_port") or names.get(k)
+    kept_edges = [{"source": s, "target": t, "count": c, "bits": widths.get((s, t)),
+                   "name": names.get((s, t))}
                   for (s, t), c in counts.items()]
     return keep, kept_edges, truncated
 
@@ -192,15 +196,28 @@ def _weight_for(edge, node):
 
 
 def _edge_label(e, label_edges, ports=False):
-    """A repeat count and a bus width are worth showing; the bare relation is not."""
-    bits = []
+    """Name the wire and give its size; a bare relation says nothing.
+
+    A width alone tells a reader how much crosses. The NAME tells them what crosses,
+    and only the name lets anyone check the drawing back against the RTL -- which is
+    the difference between a picture that illustrates and one that can be audited.
+
+    `8x` is the number of instantiations, not a multiplier on the width: `8x d_data 128b`
+    is eight connections each carrying a 128-bit `d_data`, not a 1024-bit bus. The count
+    leads so the eye does not read it as arithmetic on the number that follows.
+    """
+    parts = []
     if e.get("count", 1) > 1:
-        bits.append(f"x{e['count']}")
+        parts.append(f"{e['count']}x")
+    if ports and e.get("name"):
+        parts.append(str(e["name"]))
     if ports and e.get("bits"):
-        bits.append(f"{e['bits']}b")
+        parts.append(f"{e['bits']}b")
+    elif ports:
+        parts.append("width n/k")        # known to be unknown, not merely missing
     if label_edges:
-        bits.append("instantiates")
-    return " ".join(bits) or None
+        parts.append("instantiates")
+    return " ".join(parts) or None
 
 
 def _safe(bid):
@@ -317,8 +334,8 @@ def main():
         import subprocess as _sp
         import tempfile as _tf
         labels = {_safe(nid): nodes[nid].get("label", nid) for nid in keep}
-        want = [[labels[_safe(e["source"])], labels[_safe(e["target"])]]
-                for e in kept_edges]
+        want = [[labels[_safe(e["source"])], labels[_safe(e["target"])],
+                 e.get("name"), e.get("bits")] for e in kept_edges]
         with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             _json.dump(want, fh)
             expect = fh.name

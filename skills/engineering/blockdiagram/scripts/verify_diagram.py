@@ -63,18 +63,80 @@ def _attribute(pt, boxes):
     return None, f"ambiguous between {sorted(hits)}"
 
 
+def _labels(svg):
+    """Every non-bold text with its position: the wire labels."""
+    out = []
+    for m in re.finditer(r'<text x="([\d.-]+)" y="([\d.-]+)"(?![^>]*font-weight="bold")'
+                         r'[^>]*>([^<]*)</text>', svg):
+        out.append((float(m.group(1)), float(m.group(2)), m.group(3).strip()))
+    return out
+
+
+def _label_anchor(pts):
+    """Where the renderer puts a wire's label: centred over its longest horizontal run."""
+    runs = [(abs(a[0] - b[0]), a, b) for a, b in zip(pts, pts[1:]) if abs(a[1] - b[1]) < 1]
+    if not runs:
+        return None
+    _, a, b = max(runs)
+    return (a[0] + b[0]) / 2, a[1]
+
+
+def _match_labels(wires, labels):
+    """Assign labels to wires globally, nearest pair first.
+
+    Matching greedily per wire let an early wire take a label that sat closer to a later
+    one, so the later wire came back unlabelled and the check reported a fault in the
+    DIAGRAM that was really a fault in this checker -- which is worth more than it cost,
+    because a verifier that cries wolf gets ignored exactly when it is right.
+    """
+    pairs = []
+    for wi, pts in enumerate(wires):
+        anc = _label_anchor(pts)
+        if anc is None:
+            continue
+        for li, (lx, ly, txt) in enumerate(labels):
+            if not txt:
+                continue
+            d = abs(lx - anc[0]) + abs(ly - anc[1])
+            if d < 60:
+                pairs.append((d, wi, li))
+    pairs.sort()
+    out, tw, tl = {}, set(), set()
+    for d, wi, li in pairs:
+        if wi in tw or li in tl:
+            continue
+        tw.add(wi); tl.add(li)
+        out[wi] = labels[li][2]
+    return out
+
+
+def _parse_label(txt):
+    """`16x name 128b` -> (name, bits). Either part may be absent."""
+    if not txt:
+        return None, None
+    t = re.sub(r"^\d+x\s+", "", txt)
+    m = re.search(r"(\d+)b$", t)
+    bits = int(m.group(1)) if m else None
+    name = t[:m.start()].strip() if m else t.strip()
+    return (name or None), bits
+
+
 def recover(svg):
-    """Connections as a reader would follow them: tail -> head of each wire."""
+    """Connections as a reader would follow them: tail -> head, with name and size."""
     boxes = _boxes(svg)
+    labels = _labels(svg)
+    wires = [[tuple(map(float, p.split(","))) for p in m.group(1).split()]
+             for m in re.finditer(r'<polyline points="([^"]+)"', svg)]
+    matched = _match_labels(wires, labels)
     edges, problems = [], []
-    for m in re.finditer(r'<polyline points="([^"]+)"', svg):
-        pts = [tuple(map(float, p.split(","))) for p in m.group(1).split()]
+    for wi, pts in enumerate(wires):
         if len(pts) < 2:
             continue
         src, e1 = _attribute(pts[0], boxes)
         dst, e2 = _attribute(pts[-1], boxes)
+        name, bits = _parse_label(matched.get(wi))
         if src and dst:
-            edges.append((src, dst))
+            edges.append((src, dst, name, bits))
         else:
             problems.append(f"wire {pts[0]}->{pts[-1]}: "
                             f"start {e1 or 'ok'}, end {e2 or 'ok'}")
@@ -95,21 +157,38 @@ def main():
         print(f"  UNREADABLE  {p}")
 
     if not a.expect:
-        for s, d in edges:
-            print(f"     {s} -> {d}")
+        for s, d, n, b in edges:
+            print(f"     {s} -> {d}   {n or '(unnamed)'} {str(b)+'b' if b else '(no size)'}")
         return 1 if problems else 0
 
-    want = {(s, d) for s, d in json.load(open(a.expect))}
+    want = {tuple(r) for r in json.load(open(a.expect))}
     got = set(edges)
-    missing = want - got
-    spurious = got - want
-    for s, d in sorted(missing):
+    pairs_want = {(s, d) for s, d, *_ in want}
+    pairs_got = {(s, d) for s, d, *_ in got}
+    for s, d in sorted(pairs_want - pairs_got):
         print(f"  MISSING     {s} -> {d} is in the data but not readable from the diagram")
-    for s, d in sorted(spurious):
+    for s, d in sorted(pairs_got - pairs_want):
         print(f"  INVENTED    {s} -> {d} is in the diagram but not in the data")
-    ok = not (problems or missing or spurious)
+
+    # A connection can be present and still not be readable: no name, no size, or the
+    # wrong one. That is a defect in the diagram, not a quibble -- an unnamed wire
+    # cannot be checked against the RTL by anyone looking at the picture.
+    wl = {(s, d): (n, b) for s, d, n, b in want}
+    bad = 0
+    for s, d, n, b in sorted(got):
+        if (s, d) not in wl:
+            continue
+        en, eb = wl[(s, d)]
+        if en and n != en:
+            print(f"  NAME LOST   {s} -> {d}: data says {en!r}, diagram says {n!r}")
+            bad += 1
+        elif eb and b != eb:
+            print(f"  SIZE LOST   {s} -> {d}: data says {eb}b, diagram says {b}b")
+            bad += 1
+    ok = not (problems or (pairs_want - pairs_got) or (pairs_got - pairs_want) or bad)
     print(f"  {'ROUND TRIP OK' if ok else 'ROUND TRIP FAILED'}: "
-          f"{len(want & got)}/{len(want)} connections survive the drawing")
+          f"{len(pairs_want & pairs_got)}/{len(pairs_want)} connections, "
+          f"{len(pairs_want & pairs_got) - bad}/{len(pairs_want)} with name and size intact")
     return 0 if ok else 2
 
 

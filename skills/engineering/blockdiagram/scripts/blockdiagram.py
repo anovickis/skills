@@ -38,6 +38,7 @@ FS_SMALL = 10
 FS_PORT = 9
 PAD = 12
 ARROW = 8
+LABEL_BOTH_ENDS = 300   # a wire longer than this is named at both ends
 WIRE_PITCH = 22     # vertical room reserved per wire attached to a box
 LANE = 8           # spacing between parallel runs in a corridor
 # line weight encodes cardinality (THREE tiers only):
@@ -357,6 +358,7 @@ class Diagram:
     def _route(self):
         self._vgap_cache = None
         self._hgap_cache = None
+        self._hlanes = {}
         # pass 1: pick a side for each edge end
         info = []
         for e in self.edges:
@@ -655,25 +657,31 @@ class Diagram:
             o.append(f'<polyline points="{pts}" fill="none" stroke="{BLUE}" '
                      f'stroke-width="{e.weight:.1f}" marker-end="url(#arr{_wkey(e.weight)})"/>')
             if e.label:
-                # Sit the label on the LONGEST HORIZONTAL run of the actual path, above
-                # the wire. Using the midpoint of the first and last point put labels
-                # nowhere near the line once routes grew to five segments, and stacked
-                # them on top of each other where several wires left one box.
+                # Label the wire where it can be read. On a long run the two ends can be
+                # most of the diagram apart, and a single mid-wire label means tracing
+                # the line back to find out what it is -- so a long wire is named at
+                # BOTH ends. A halo goes behind the glyphs because dark text over a dark
+                # fat wire is simply not readable.
                 runs = [(abs(q[0] - r[0]), q, r) for q, r in zip(e.pts, e.pts[1:])
                         if abs(q[1] - r[1]) < 1]
+                span = sum(abs(q[0] - r[0]) + abs(q[1] - r[1])
+                           for q, r in zip(e.pts, e.pts[1:]))
+                spots = []
                 if runs:
-                    _, q, r = max(runs)
-                    lx, ly = (q[0] + r[0]) / 2, q[1] - 5 - e.weight / 2
+                    runs.sort()
+                    _, q, r = runs[-1]
+                    spots.append(((q[0] + r[0]) / 2, q[1] - 5 - e.weight / 2))
+                    if span > LABEL_BOTH_ENDS and len(runs) > 1:
+                        _, q2, r2 = runs[-2]
+                        spots.append(((q2[0] + r2[0]) / 2, q2[1] - 5 - e.weight / 2))
                 else:
                     a, b = e.pts[0], e.pts[-1]
-                    lx, ly = (a[0] + b[0]) / 2, min(a[1], b[1]) - 5
-                # A halo, because dark text drawn straight over a dark fat wire is
-                # simply not readable. paint-order puts the stroke behind the fill, so
-                # the glyphs keep their colour and gain a light outline.
-                o.append(f'<text x="{lx:.0f}" y="{ly:.0f}" fill="{GREY}" '
-                         f'font-size="{FS_SMALL}" text-anchor="middle" '
-                         f'stroke="#ffffff" stroke-width="3" stroke-linejoin="round" '
-                         f'paint-order="stroke">{_esc(e.label)}</text>')
+                    spots.append(((a[0] + b[0]) / 2, min(a[1], b[1]) - 5))
+                for lx, ly in spots:
+                    o.append(f'<text x="{lx:.0f}" y="{ly:.0f}" fill="{GREY}" '
+                             f'font-size="{FS_SMALL}" text-anchor="middle" '
+                             f'stroke="#ffffff" stroke-width="3" stroke-linejoin="round" '
+                             f'paint-order="stroke">{_esc(e.label)}</text>')
         for bid in self._order:
             o.append(self._box_svg(self.boxes[bid]))
         o.append("</svg>")
