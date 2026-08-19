@@ -297,6 +297,131 @@ class Diagram:
                     stack.pop()
         return back
 
+    def _place_forest_bands(self, fpred, fsucc, pos):
+        """Place a containment forest as stacked subtree BANDS. False if not one.
+
+        Deliberately narrow. It takes over only for a graph that is a forest -- no box with
+        two parents, no feedback wire -- with real hierarchy under the roots, and only when
+        a rank is wide enough that the rank-wrapping below would have shifted the ranks
+        apart. Everything else keeps the layered placement it has always had. On the
+        eight-diagram sample set that means *nothing changes*: all eight are single-level
+        fans, where there is no subtree to band and rank wrapping is the right answer.
+
+        A fan and a hierarchy want opposite things and the difference is worth stating. In
+        a fan every child is a leaf, so spreading them over several columns costs only the
+        parent's own wires. In a hierarchy those columns each carry a whole further
+        generation, and putting a rank's columns side by side leaves every parent reaching
+        across them.
+        """
+        ids = list(self.boxes)
+        if getattr(self, "_back_edges", None):
+            return False                      # a loop is not a containment tree
+        if any(len(fpred[i]) > 1 for i in ids):
+            return False                      # two parents: not a forest
+        roots = [i for i in ids if not fpred[i]]
+        if not roots or len(roots) == len(ids):
+            return False
+        band_roots = [c for r in roots for c in sorted(fsucc[r], key=lambda i: pos[i])]
+        if not band_roots:
+            return False
+        # Real hierarchy, not a fan: at least two of the band roots must have children of
+        # their own. One is not worth a different placement, and none is a fan.
+        if sum(1 for b in band_roots if fsucc[b]) < 2:
+            return False
+
+
+        def band(root):
+            """(width, height, {id: (col, row)}) for one subtree, tidily.
+
+            Leaves take consecutive rows; a parent sits at the middle of the rows its
+            children span. Sibling row-ranges are disjoint and ordered, so the midpoints
+            are distinct and no two boxes in a column can land on the same row.
+            """
+            place, nxt = {}, [0]
+
+            def rec(node, d, seen):
+                if node in seen:              # a forest has none, but never loop
+                    return None
+                seen = seen | {node}
+                kids = sorted(fsucc[node], key=lambda i: pos[i])
+                spans = [s for s in (rec(c, d + 1, seen) for c in kids) if s]
+                if not spans:
+                    r = nxt[0]
+                    nxt[0] += 1
+                    place[node] = (d, r)
+                    return (r, r)
+                lo, hi = min(s[0] for s in spans), max(s[1] for s in spans)
+                place[node] = (d, (lo + hi) // 2)
+                return (lo, hi)
+
+            rec(root, 0, frozenset())
+            return (max(d for d, _ in place.values()) + 1, nxt[0], place)
+
+        bands = [band(b) for b in band_roots]
+        if any(not p for _w, _h, p in bands):
+            return False
+        placed = {k for _w, _h, p in bands for k in p}
+        if placed | set(roots) != set(ids):
+            return False                      # something is not reachable; leave it alone
+        bw = max(w for w, _h, _p in bands)
+        total_h = sum(h for _w, h, _p in bands)
+
+        def pack(budget):
+            """Bands into vertical groups, in order, each group up to `budget` rows."""
+            groups, cur, cur_h = [], [], 0
+            for bnd in bands:
+                if cur and cur_h + bnd[1] > budget:
+                    groups.append((cur, cur_h))
+                    cur, cur_h = [], 0
+                cur.append(bnd)
+                cur_h += bnd[1]
+            if cur:
+                groups.append((cur, cur_h))
+            return groups
+
+        # Pick the grouping whose shape reads best. A column is far wider than a row is
+        # tall, so "square in cells" is nothing like square on the page -- and the cell size
+        # has to be MEASURED, not assumed: guessing 240px per column when the boxes wanted
+        # 157 chose a portrait figure over a landscape one and thought it was doing well.
+        bs = list(self.boxes.values())
+        col_px = sum(b.need_w() for b in bs) / len(bs) + self.gap_x
+        row_px = sum(b.need_h() for b in bs) / len(bs) + self.gap_y
+        # More than one group splits the roots' OWN children across columns, and a parent
+        # whose children are scattered is the thing the ordering sweeps work hardest to
+        # avoid. So it is charged for: SPLIT is in log-aspect units, meaning a second group
+        # has to be worth about a factor of e in shape before it is taken. A 13-box
+        # two-level tree therefore stays in one group -- three columns, every family whole
+        # -- while a 46-box hierarchy, whose single group would be four columns by forty
+        # rows, takes three groups and the split.
+        SPLIT = 1.0
+        best = None
+        for g in range(1, len(bands) + 1):
+            groups = pack(max(int(math.ceil(total_h / g)), max(h for _w, h, _p in bands)))
+            cols, rows = 1 + len(groups) * bw, max(h for _g, h in groups)
+            score = abs(math.log((cols * col_px) / (rows * row_px)) - math.log(1.7))
+            if len(groups) > 1:
+                score += SPLIT
+            if best is None or score < best[0]:
+                best = (score, groups, cols, rows)
+        _score, groups, ncol, nrow = best
+
+        for gi, (grp, _h) in enumerate(groups):
+            row = 0
+            for bw_i, bh, place in grp:
+                for i, (dc, dr) in place.items():
+                    self.boxes[i].col = 1 + gi * bw + dc
+                    self.boxes[i].row = row + dr
+                row += bh
+        for k, r in enumerate(roots):         # roots on the left, centred
+            self.boxes[r].col = 0
+            self.boxes[r].row = max((nrow - len(roots)) // 2, 0) + k
+        # Count the grid from what was actually filled. Groups are `bw` columns wide but
+        # the last one need not use them all -- a shallower band leaves the tail empty, and
+        # an empty column is still a column's worth of gap in the finished figure.
+        self.ncol = max(b.col for b in self.boxes.values()) + 1
+        self.nrow = max(b.row for b in self.boxes.values()) + 1
+        return True
+
     def autoplace(self):
         """Assign (col,row) from connectivity. Layered left-to-right flow with
         median-barycenter row ordering (few crossings, straightened chains) and
@@ -406,6 +531,38 @@ class Diagram:
         for r in ranks:
             ranks[r].sort(key=lambda i: pos[i])
 
+        # 2b. A CONTAINMENT TREE IS WRAPPED BY SUBTREE, NOT BY RANK.
+        #
+        # Wrapping a wide rank over several columns (below) is right for a fan, and wrong
+        # for a hierarchy, in a way that is easy to miss because the lint stays clean. The
+        # columns of one rank sit side by side, so the NEXT rank starts k columns further
+        # right -- and every parent-to-child wire then spans k columns instead of one,
+        # crossing every column of its own rank on the way. Measured on a 46-box, 4-level
+        # containment tree: spans of 3, 4 and 5 columns, and 65 crossings on a graph that
+        # is drawable with almost none.
+        #
+        # Banding fixes the structure rather than the symptom: each subtree is laid out on
+        # its own columns, parent one column left of its children throughout, and the bands
+        # are stacked and grouped to keep the figure the shape of a figure. The only wires
+        # that then span more than one column are the roots' own, and there are as many of
+        # those as there are groups.
+        # The decision is MEASURED, not guessed at from the box count: chunk the ranks as
+        # step 3 would, see what it does to the wires, and band only if it really does
+        # stretch them. A 13-box two-level tree wraps its leaf rank into three columns and
+        # stretches two wires of twelve -- fine, and banding it would split the root's own
+        # children across groups for no gain. The 46-box hierarchy stretches 35 of 45.
+        cap = max(3, int(math.ceil(math.sqrt(max(len(ids), 1)))))
+        would = {}
+        for col, (_r, lst) in enumerate(self._chunk_ranks(ranks, fpred, cap)):
+            for i in lst:
+                would[i] = col
+        spans = [abs(would[e.dst] - would[e.src]) for e in self.edges
+                 if e.shape != "tap" and e.src in would and e.dst in would
+                 and (e.src, e.dst) not in back and e.src != e.dst]
+        stretched = sum(1 for v in spans if v > 1) / len(spans) if spans else 0
+        if stretched > 1 / 3 and self._place_forest_bands(fpred, fsucc, pos):
+            return
+
         # 3. assign cells; centre each column vertically for balance. Columns are
         # re-indexed densely so empty ranks (left by tightening) don't appear.
         #
@@ -415,7 +572,17 @@ class Diagram:
         # fourteen lint failures for wires crossing boxes. There was no free corridor
         # because the column WAS the corridor. Wrapping keeps the diagram near-square,
         # which is both easier to read and leaves the router somewhere to go.
-        cap = max(3, int(math.ceil(math.sqrt(max(len(ids), 1)))))
+        chunked = self._chunk_ranks(ranks, fpred, cap)
+        nrow = max((len(c) for _, c in chunked), default=1)
+        for col, (_, lst) in enumerate(chunked):
+            off = (nrow - len(lst)) // 2
+            for k, i in enumerate(lst):
+                self.boxes[i].col = col
+                self.boxes[i].row = off + k
+        self.ncol, self.nrow = len(chunked), nrow
+
+    def _chunk_ranks(self, ranks, fpred, cap):
+        """Ranks into columns: a wide rank spread over several, on family boundaries."""
         chunked = []                       # [(rank, [ids])] in column order
         for r in sorted(ranks):
             lst = ranks[r]
@@ -450,13 +617,7 @@ class Diagram:
                 cur.extend(run)
             if cur:
                 chunked.append((r, cur))
-        nrow = max((len(c) for _, c in chunked), default=1)
-        for col, (_, lst) in enumerate(chunked):
-            off = (nrow - len(lst)) // 2
-            for k, i in enumerate(lst):
-                self.boxes[i].col = col
-                self.boxes[i].row = off + k
-        self.ncol, self.nrow = len(chunked), nrow
+        return chunked
 
     # ---- layout ----------------------------------------------------------
     def _layout(self):
@@ -2178,11 +2339,25 @@ def _selftest():
     kids14 = {}
     for e in d14.edges:
         kids14.setdefault(e.src, []).append((d14.boxes[e.dst].col, d14.boxes[e.dst].row))
-    check("tree: each parent's children stay together",
-          all(len({c for c, _ in v}) == 1 and
-              sorted(r for _, r in v) == list(range(min(r for _, r in v),
-                                                   min(r for _, r in v) + len(v)))
-              for v in kids14.values()))
+    # "Together" means NOT INTERLEAVED: one column, and nobody else's child in among
+    # them. It used to demand consecutive rows, which is a proxy for that and a proxy that
+    # a tidy tree breaks by design -- a parent is centred on the rows its children span, so
+    # siblings one level up sit at rows 1, 4, 7 with empty cells between, aligned each to
+    # its own family. Empty cells between siblings are the layout working; another family's
+    # box between them is the bug this check is for.
+    occupied = {}
+    for b in d14.boxes.values():
+        occupied.setdefault(b.col, {})[b.row] = b.id
+    def together(v):
+        cols = {c for c, _ in v}
+        if len(cols) != 1:
+            return False
+        col = cols.pop()
+        rows = [r for _, r in v]
+        mine = {occupied[col][r] for r in rows}
+        return all(occupied[col].get(r) in mine or r not in occupied[col]
+                   for r in range(min(rows), max(rows) + 1))
+    check("tree: each parent's children stay together", all(together(v) for v in kids14.values()))
 
     # A global signal is a tap per block, not a wire per block.
     d15 = Diagram("clock rail")
@@ -2314,6 +2489,33 @@ def _selftest():
     # boxes at fast. The promotion that fixes it is now its own step, at either setting.
     # This case is the smallest that reproduces: eleven blocks and fewer come out clean
     # either way, which is why the gate pays ~3s for it.
+    # ---- a hierarchy is banded, not rank-wrapped ----------------------------------
+    # Placement only: no routing, so this costs nothing, and placement is where the bug
+    # was. A containment tree wants every parent one column left of its children. Rank
+    # wrapping put a rank's columns side by side, so the next rank began k columns further
+    # right and the wires stretched to reach it: on this 31-box, three-level tree, 21 of
+    # its 30 wires spanned more than one column, and 65 crossings on a 46-box version were
+    # the visible half of it. What is left over is the roots' own wires reaching into each
+    # group, which is the price of a landscape figure rather than a tower.
+    d33 = Diagram("containment hierarchy")
+    d33.node("root", "Root", kind="emphasis")
+    frontier, seq = ["root"], 0
+    for kids in (3, 3, 2):
+        nxt = []
+        for p in frontier:
+            for _ in range(kids):
+                seq += 1
+                d33.node(f"h{seq}", f"Blk{seq}")
+                d33.edge(p, f"h{seq}", label="tl [64]", weight="bus")
+                nxt.append(f"h{seq}")
+        frontier = nxt
+    d33.autoplace()
+    spans33 = [abs(d33.boxes[e.dst].col - d33.boxes[e.src].col) for e in d33.edges]
+    check("hierarchy: a parent sits one column left of its children",
+          sum(1 for v in spans33 if v != 1) <= 3)
+    check("hierarchy: and the figure is still wider than it is tall",
+          d33.ncol > d33.nrow)
+
     d32 = _fan3(effort="fast", n=4)
     rep32 = d32.lint()
     check("fast effort: legality is not traded, even 17 blocks in one row",

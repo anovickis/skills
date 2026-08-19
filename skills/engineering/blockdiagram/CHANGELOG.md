@@ -1,5 +1,66 @@
 # Changelog — `blockdiagram` skill
 
+## 0.7.4 — a hierarchy is wrapped by subtree, not by rank
+A 46-box containment tree drew with **65 crossings** on a graph that needs almost none, and
+the lint stayed clean throughout, which is why it survived three releases. Wrapping a wide
+rank over several columns is right for a fan and wrong for a hierarchy: the columns of one
+rank sit side by side, so the NEXT rank starts *k* columns further right, and every
+parent-to-child wire spans *k* columns instead of one — crossing every column of its own
+rank on the way. Measured spans on that tree were 3, 4 and 5.
+
+Fanning and nesting want opposite things. In a fan every child is a leaf, so spreading them
+over columns costs only the parent's own wires. In a hierarchy each of those columns carries
+a whole further generation, and putting a rank's columns side by side leaves every parent
+reaching across them.
+
+- **Bands.** For a containment forest, each subtree is laid out on its own columns — parent
+  one column left of its children throughout — and the bands are stacked, then grouped into
+  column-blocks to keep the figure the shape of a figure. Rows within a band are tidy: a
+  parent is centred on the rows its children span.
+- **The gate measures the disease, not a proxy for it.** It chunks the ranks exactly as the
+  old path would, counts what fraction of the wires that stretches past one column, and
+  bands only above a third. Two earlier gates were wrong and the sweep caught both: the
+  widest *fan* from any one parent (so the case this was written for never engaged at all),
+  then the widest *rank*. A 13-box two-level tree stretches 2 wires of 12 and is left alone;
+  the 46-box hierarchy stretches 35 of 45.
+- **Splitting the roots' children is charged for.** More than one group scatters the roots'
+  own children across columns, which is what the ordering sweeps work hardest to avoid, so
+  it has to be worth about a factor of e in aspect before it is taken.
+
+| case | before | after | parked line, for scale |
+|---|---|---|---|
+| containment depth 2 (25 boxes) | 14 crossings, ar 2.01 | **6**, ar 1.48 | 0, ar **0.45** |
+| containment depth 3–5 (46 boxes) | **65** crossings, ar 1.72 | **6**, ar 1.58 | 0, ar **0.58** |
+
+The parked engine's zero is in that table because it is the honest comparison and it is not
+the better answer: it reaches zero by putting one rank per column and accepting a figure
+taller than it is wide, which no page column takes. Not wrapping at all, measured on today's
+engine, gives 23 crossings at aspect 0.27 — so banding beats both the wrap and the tower.
+The six that remain are the roots' own wires reaching into each group, and there are as many
+of those as there are groups; one group would draw zero and be a tower again.
+
+**Nothing else moves, by construction.** The eight sample diagrams are identical figure for
+figure and canvas for canvas — every one of them is a single-level fan, where there is no
+subtree to band and rank wrapping is the right answer. A graph with a box that has two
+parents, or any feedback wire, is not a forest and never reaches this path; that was checked
+by instrumenting the placer rather than by reading the gate: it engages for pure containment
+and declines the 53-box merge, the five-level SoC and every mixed sweep case. Stress suite
+unchanged, 0 FAILs.
+
+One self-test check had to change, and it is worth saying why rather than quietly editing it.
+`tree: each parent's children stay together` demanded a family occupy **consecutive** rows.
+That was a proxy for "not interleaved with another family", and it is a proxy a tidy tree
+breaks by design: a parent centred on its children leaves siblings one level up at rows 1, 4
+and 7, with empty cells between them, each aligned to its own family. Empty cells between
+siblings are the layout working. The check now asserts the intent — one column, and no other
+family's box among them — and was itself tested against an interleaved case, a gapped-but-
+clean one, and a split-column one.
+
+Selftest 50 checks -> 52; ALL PASS. The two new ones assert the placement and nothing else
+— no routing, so they are almost free, and placement is where the bug was: on a 31-box
+three-level tree, 21 of its 30 wires used to span more than one column and now 2 do, those
+being the roots' reaching into each group.
+
 ## 0.7.3 — legality is not an effort setting
 0.7.2 left one hole and said so: a 17-box clock fan drew clean at full effort and with
 **fifteen wires under boxes at fast**. The interesting part is what it was not. Fast and full

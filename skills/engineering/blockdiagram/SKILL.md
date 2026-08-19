@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.7.3
+version: 0.7.4
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -179,6 +179,12 @@ the FAIL message now names the offending boxes/edges and the fix:
    box — and widens the band if it is full. So this FAIL should be rare, and when it does
    appear the placement is genuinely over-constrained rather than merely unlucky: read it
    as "there is no room", not "reorder the rows".
+   A **containment hierarchy** is placed differently from a fan, automatically: subtrees are
+   laid out as bands, each parent one column left of its children, rather than one rank
+   spread over several columns. That is what keeps a nested tree's wires short — a fan wants
+   the opposite, and gets it. Nothing to ask for; it engages when the graph is a forest deep
+   enough to have subtrees, and a tidy tree centres each parent over its children, so
+   expect empty cells between siblings one level up.
 2. **Stacked parallel segments.** Two edges sharing one corridor overlap into a single
    thick line. Fix: do **not** draw duplicate/parallel edges for the same relationship —
    draw one representative wire (a fan of identical lanes reads as one bus anyway); give
