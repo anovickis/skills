@@ -938,6 +938,71 @@ class Diagram:
                 break
         return best
 
+    def _illegal_edges(self):
+        """Which wires are drawn under a box or along another, and how badly.
+
+        The rules lint reports on, exactly: a wire's own endpoint boxes do not count, a
+        `straight` edge is an explicit author choice and is exempt, and a wire is never
+        compared against itself. So this promotes precisely the wires that would be
+        reported, and never one that merely looks bad to a broader test.
+        """
+        tally = {}
+        live = [(i, e) for i, e in enumerate(self.edges) if e.shape != "straight"]
+        for i, e in live:
+            keep = {e.src, e.dst}
+            for sg in zip(e.pts, e.pts[1:]):
+                if sg[0] == sg[1]:
+                    continue
+                for b in self.boxes.values():
+                    if b.id not in keep and _seg_in_box(sg, b):
+                        tally[i] = tally.get(i, 0) + 1
+        segs = [(sg, i) for i, e in live
+                for sg in zip(e.pts, e.pts[1:]) if sg[0] != sg[1]]
+        for j, (a, ia) in enumerate(segs):
+            for b, ib in segs[j + 1:]:
+                if ia != ib and _stacked(a, b):
+                    tally[ia] = tally.get(ia, 0) + 1
+                    tally[ib] = tally.get(ib, 0) + 1
+        return tally
+
+    def _rescue_illegal(self, rounds=3):
+        """Give a wire drawn under a box first pick of the corridors.
+
+        Routing is sequential and ordered shortest-first, so the wire that most needs the
+        outside band -- the long one crossing the whole figure -- asks for it LAST, once
+        the short runs have taken every lane. `_ripup` already promotes wires that fight
+        each other, but it is a rung of the crossing ladder and off at fast effort, so a
+        draft could be left with a wire under a box while full effort drew the very same
+        placement cleanly: 17 boxes in one row, fifteen FAILs at fast against none at full,
+        same grid, same canvas.
+
+        Legality is not an effort setting, so this is not a rung. It costs one re-route per
+        wire it promotes and does nothing at all unless something is already illegal.
+        Scored on `_quality()`, where violations dominate crossings, so a promotion that
+        buys legality is kept even if the picture gains a crossing, and one that buys
+        nothing is put straight back.
+        """
+        best = self._quality()
+        if not best[0]:
+            return best
+        self._boost = set(getattr(self, "_boost", set()))
+        for _ in range(rounds):
+            added = False
+            for idx, _n in sorted(self._illegal_edges().items(),
+                                  key=lambda kv: -kv[1])[:8]:
+                if idx in self._boost:
+                    continue
+                self._boost.add(idx)
+                q = self._score()
+                if q < best:
+                    best, added = q, True
+                else:
+                    self._boost.discard(idx)
+                    self._score()          # put the arrangement back
+            if not added or not best[0]:
+                break
+        return best
+
     def _ladder(self):
         """One walk of the crossing ladder, keeping the best arrangement seen."""
         self._hint, self._boost = None, set()
@@ -976,19 +1041,29 @@ class Diagram:
         # somewhere the first never was -- the drawn figure then differs from the linted
         # one, which is the exact hazard lint(reroute=True) exists to avoid.
         self._band_lanes = 0
-        best = self._ladder()
+        self._ladder()
         if not self._quality()[0]:
-            return best                  # legal already: the drawing is untouched
-        keep = (self._quality(), 0, self._state(), best)
-        for lanes in (8, 16):
+            return self._crossings()     # nothing was wrong: untouched, and cheap
+        # Something was illegal. Both repairs are now on the table and BOTH are tried,
+        # because reaching legality is not the same as drawing it well: promoting the
+        # offender is far cheaper than widening the figure, but on a 45-box five-level
+        # hierarchy the wider band settled at 186 crossings where promotion alone settled
+        # at 307. Stopping at the first legal arrangement took the cheap one and shipped a
+        # figure two thirds worse -- so keep the best by _quality(), violations first and
+        # crossings as the tie-break, which is exactly the judgement this case needs.
+        self._rescue_illegal()
+        keep = (self._quality(), 0, self._state(), self._crossings())
+        # One band step, not two: every case measured is repaired at 8 lanes and none has
+        # ever been repaired by 16, so a second step only ever bought another walk of the
+        # ladder. If a figure turns up that needs more, the lint says so rather than the
+        # engine grinding for it.
+        for lanes in (8,):
             self._band_lanes = lanes
-            n = self._ladder()
-            q = self._quality()
+            self._ladder()
+            self._rescue_illegal()
+            q, n = self._quality(), self._crossings()
             if q < keep[0]:
                 keep = (q, lanes, self._state(), n)
-            if not q[0]:
-                return n
-            # A wider band that fixed nothing is just a taller picture.
         self._band_lanes = keep[1]
         self._restore(keep[2])
         return keep[3]
@@ -2186,12 +2261,12 @@ def _selftest():
     # tracks for the whole drawing, so the band also has to be given room to hold it.
     # Drawn at fast effort: the gate must stay quick, and legality is not an effort
     # setting -- see the fast-mode checks above.
-    def _fan3(effort="fast"):
-        d = Diagram("clock fan across three columns", effort=effort)
+    def _fan3(effort="fast", n=3):
+        d = Diagram(f"clock fan, {n * n} blocks", effort=effort)
         d.node("clk", "ClockSource", ["clk + rst"], kind="emphasis")
         prev = None
-        for c in range(3):
-            for r in range(3):
+        for c in range(n):
+            for r in range(n):
                 b = f"f{c}_{r}"
                 d.node(b, f"Blk{c}{r}")
                 d.edge("clk", b, label="clk/rst", kind="clock")
@@ -2231,6 +2306,20 @@ def _selftest():
     d31._svg()
     check("band: the figure drawn is the figure that was linted",
           drawn31 == [tuple(p) for e in d31.edges for p in e.pts])
+    # Legality is not an effort setting. Seventeen blocks in one row, and the wire to the
+    # far end has to get past every one of them: routing is shortest-first, so it asks for
+    # the outside band last, once the short runs have taken the lanes. Full effort rescued
+    # it only as a side effect of `_ripup`, which is a rung of the crossing ladder and off
+    # at fast -- so the same placement drew clean at full and with FIFTEEN wires under
+    # boxes at fast. The promotion that fixes it is now its own step, at either setting.
+    # This case is the smallest that reproduces: eleven blocks and fewer come out clean
+    # either way, which is why the gate pays ~3s for it.
+    d32 = _fan3(effort="fast", n=4)
+    rep32 = d32.lint()
+    check("fast effort: legality is not traded, even 17 blocks in one row",
+          not any(l == "FAIL" for l, _ in rep32))
+    check("fast effort: and the offender was promoted, not the figure inflated",
+          getattr(d32, "_band_lanes", 0) <= 8)
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

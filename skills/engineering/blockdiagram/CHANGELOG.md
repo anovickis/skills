@@ -1,5 +1,56 @@
 # Changelog — `blockdiagram` skill
 
+## 0.7.3 — legality is not an effort setting
+0.7.2 left one hole and said so: a 17-box clock fan drew clean at full effort and with
+**fifteen wires under boxes at fast**. The interesting part is what it was not. Fast and full
+produced the *same placement* — grid 17x1, canvas 2743x574, the same 8 lanes of outside band
+— so this was never about the shorter ladder finding a worse arrangement, and never about
+the router's search, which is identical at either setting.
+
+It was **ordering**. Routing is sequential and goes shortest-first, so the wire that most
+needs the outside band — the long one that has to get past all seventeen blocks in the row —
+asks for it LAST, once the short runs have taken every lane. Full effort rescued it only as a
+*side effect* of `_ripup`, which promotes wires guilty of crossings and is a rung of the
+crossing ladder that fast switches off. Legality was riding on an optional optimisation.
+
+- **`_rescue_illegal` is a step, not a rung.** Same promotion mechanism `_ripup` uses, but it
+  selects wires by the rules the lint actually reports — a wire's own endpoint boxes do not
+  count, a `straight` edge is the author's choice and exempt, no wire is compared against
+  itself — so it promotes exactly what would be reported and nothing that merely looks bad to
+  a broader test. Scored on `_quality()`, violations dominating crossings, so a promotion
+  that buys legality is kept even if the picture gains a crossing, and one that buys nothing
+  is put straight back.
+- **Both repairs are tried, and the better picture wins.** Promotion is far cheaper than
+  widening the figure, so the obvious move was to stop at the first arrangement that came
+  out legal. That was wrong, and the five-level 45-box hierarchy said so: promotion alone
+  reaches legality and settles at **307 crossings**, where widening the band settles at
+  **186**. Reaching legality is not the same as drawing it well. So once anything is
+  illegal both repairs run and the winner is chosen on `_quality()` — violations first,
+  crossings as the tie-break, which is precisely the judgement this case needs. A figure
+  that was legal after the first walk of the ladder still returns immediately and pays for
+  neither.
+- **One band step, not two.** Every case measured is repaired at 8 lanes and none has ever
+  been repaired by 16, so the second step only bought another walk of the ladder. Dropped;
+  if a figure turns up needing more, the lint says so rather than the engine grinding for
+  it. That keeps a repaired figure at two walks — the same cost 0.7.2 paid.
+
+| case | before | after |
+|---|---|---|
+| 17-box clock fan @ **fast** | 15 FAILs, 3.2s | **0 FAILs, 2.8s** |
+| the same 8 fan cases, both efforts | 15 FAILs at fast | **all 0** |
+| the eight sample diagrams | 0 FAILs, 76 crossings | **identical**, every figure |
+| five-level SoC (45 boxes, 82 wires) | 0 FAILs, 186 crossings | 0 FAILs, **186** |
+| merged hierarchy (53 boxes) | 0 FAILs, 71 crossings | 0 FAILs, **71** |
+
+Faster *and* correct on the case it fixes: the cheap promotion displaces the expensive band
+widening it used to need. And the eight come out identical figure for figure, canvas for
+canvas — the step does nothing at all unless something is already illegal, which is the
+property that makes it safe to have on at every effort setting.
+
+Selftest 48 checks -> 50; ALL PASS, 14.3s. The new case costs ~3s of that and is the
+smallest that reproduces: eleven blocks and fewer draw clean at either setting, so a cheaper
+gate would not have caught this.
+
 ## 0.7.2 — round the outside, and the room to do it
 A wire with nowhere legal to go was drawn straight through whatever stood in the way. Ten
 boxes and seventeen wires were enough to produce it: **one clock fan across three columns,
@@ -41,11 +92,10 @@ wire no longer cutting through the corridors, so the figures that were merely *c
 gained too -- 103 crossings to 71 on the 53-box merge.
 
 Every case repaired above needed only the FIRST escalation step, 8 lanes. The 16-lane step
-has never yet been the one that helped; it costs nothing when 8 works (the loop stops as
-soon as the figure is legal) and is kept as margin rather than as a measured need. The
-five-level SoC pays for it in time, though: ~6.5 min to ~14, because it takes a second walk
-of the ladder to get there. A figure that is already legal after the first walk pays
-nothing.
+has never yet been the one that helped; it is kept as margin rather than as a measured need.
+(0.7.3 drops it.) The five-level SoC pays for the escalation in time: ~6.5 min to ~14,
+because it takes a second walk of the ladder to get there. A figure that is already legal
+after the first walk pays nothing.
 
 Three things stated plainly rather than buried.
 

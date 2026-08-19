@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.7.2
+version: 0.7.3
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -122,13 +122,12 @@ falls back to a straight one, which put 21 wires under boxes across the samples.
 are an aesthetic cost and fair game for a draft; a wire hidden under a block is a lie about
 the design.
 
-What fast mode **can** cost you is the repair. Legality is not only found by the router; on
-a crowded figure it is reached by the ladder reordering and moving boxes, and by widening
-the outside band when wires are still illegal — and fast walks a shortened ladder. Measured
-on the worst case to hand, a 17-box clock fan: full effort 0 wires under a box, fast 15. So
-on a dense figure `lint` at fast effort may report FAILs that full effort does not, and a
-draft that lints clean is good evidence but not a guarantee for the one you ship. Draw the
-figure you are shipping at full effort and believe that lint.
+Nor does it trade **legality**, and that is enforced rather than hoped for. It briefly was
+not: repair partly rode on `_ripup`, a rung of the crossing ladder that fast switches off, so
+a 17-box clock fan drew clean at full effort and with fifteen wires under boxes at fast —
+same placement, same canvas. Promoting the offending wire is now its own step at either
+setting, and the self-test pins that case. What fast still trades is crossings: on that same
+figure, 87 against full effort's 57.
 
 Fast is not uniformly worse, either — with a shorter search it sometimes lands better
 (one sample went 9 crossings to 4). It is less *thorough*, not systematically worse.
