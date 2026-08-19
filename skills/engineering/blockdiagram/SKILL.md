@@ -1,6 +1,6 @@
 ---
 name: blockdiagram
-version: 0.7.1
+version: 0.7.2
 description: >-
   Author technical SVG block diagrams for hardware/spec documents from a small
   Python DSL with explicit grid placement (or connectivity-driven autoplace)
@@ -115,12 +115,20 @@ Fast mode tries fewer *arrangements*: measured over eight samples, **3.5x quicke
 more crossings** (23.2s → 6.6s, 77 → 93); on a 40-box hierarchy, 46s → 14s for 25 → 40.
 Use it in the draw-look-adjust loop, then render the real figure at full effort.
 
-What fast mode does **not** trade is legality. Nothing under a box, no wire along another,
-no loops — the router's search for a legal path is identical at either setting. Narrowing
-*that* was tried for speed and rejected: at a dozen tracks instead of forty the router
-sometimes finds no legal path and falls back to a straight one, which put 21 wires under
-boxes across the samples. Crossings are an aesthetic cost and fair game for a draft; a
-wire hidden under a block is a lie about the design. The self-test asserts this.
+Fast mode does not narrow the **search**: the router considers the same paths and applies
+the same legality rules at either setting. Narrowing *that* was tried for speed and
+rejected — at a dozen tracks instead of forty the router sometimes finds no legal path and
+falls back to a straight one, which put 21 wires under boxes across the samples. Crossings
+are an aesthetic cost and fair game for a draft; a wire hidden under a block is a lie about
+the design.
+
+What fast mode **can** cost you is the repair. Legality is not only found by the router; on
+a crowded figure it is reached by the ladder reordering and moving boxes, and by widening
+the outside band when wires are still illegal — and fast walks a shortened ladder. Measured
+on the worst case to hand, a 17-box clock fan: full effort 0 wires under a box, fast 15. So
+on a dense figure `lint` at fast effort may report FAILs that full effort does not, and a
+draft that lints clean is good evidence but not a guarantee for the one you ship. Draw the
+figure you are shipping at full effort and believe that lint.
 
 Fast is not uniformly worse, either — with a shorter search it sometimes lands better
 (one sample went 9 crossings to 4). It is less *thorough*, not systematically worse.
@@ -139,7 +147,9 @@ The router searches: for each wire it considers up to forty three-segment paths 
 none is clean, a thousand five-segment ones, and the whole diagram is re-routed for every
 candidate arrangement the crossing ladder tries. That is ~600 full re-routes on a 40-box
 hierarchy. It is *bounded* work, not unbounded, but it is not free: budget a few seconds
-for a dozen boxes and under a minute for forty. If a figure is slow, it is the ladder
+for a dozen boxes and under a minute for forty. A figure that is still illegal after the
+ladder pays for up to two more walks of it, on a wider outside band — only a figure with a
+wire under a box, and worth it to stop drawing one. If a figure is slow, it is the ladder
 earning its keep — on that 40-box tree, module movement alone takes the crossings from 117
 to 25.
 
@@ -165,6 +175,11 @@ the FAIL message now names the offending boxes/edges and the fix:
    `src_side=`/`dst_side=` (leave, say, the top and come back down); or move the middle box
    to another row/column. A "hub" box that talks to many others belongs **centrally**
    (adjacent to all of them), not at one end of a row.
+   The router now handles the common form of this itself: when no interior corridor is
+   legal it takes that one wire round the **outside** — along the band above or below every
+   box — and widens the band if it is full. So this FAIL should be rare, and when it does
+   appear the placement is genuinely over-constrained rather than merely unlucky: read it
+   as "there is no room", not "reorder the rows".
 2. **Stacked parallel segments.** Two edges sharing one corridor overlap into a single
    thick line. Fix: do **not** draw duplicate/parallel edges for the same relationship —
    draw one representative wire (a fan of identical lanes reads as one bus anyway); give

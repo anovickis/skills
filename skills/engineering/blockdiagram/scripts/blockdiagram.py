@@ -494,8 +494,14 @@ class Diagram:
         col_w = [max(w, 90) for w in col_w]
         row_h = [max(h, 50) for h in row_h]
 
+        # Room for the outside bands, when routing has shown they are needed. Reserving
+        # it in the LAYOUT is the point: a corridor the canvas does not contain is a
+        # corridor that gets cropped, so the space above the first row and below the last
+        # has to be real before the router is allowed to count on it.
+        band = getattr(self, "_band_lanes", 0) * LANE
+
         def cx(c): return self.margin + sum(col_w[:c]) + c * self.gap_x
-        def cy(r): return self.margin + self.title_h + sum(row_h[:r]) + r * self.gap_y
+        def cy(r): return self.margin + self.title_h + band + sum(row_h[:r]) + r * self.gap_y
 
         for b in self.boxes.values():
             b.x = cx(b.col); b.y = cy(b.row)
@@ -504,7 +510,7 @@ class Diagram:
             b._resolve_ports()
         self._col_w, self._row_h = col_w, row_h
         self.W = cx(self.ncol) - self.gap_x + self.margin
-        self.H = cy(self.nrow) - self.gap_y + self.margin
+        self.H = cy(self.nrow) - self.gap_y + self.margin + band
 
     def _route(self, order_hint=None):
         """Place every wire. `order_hint` overrides the order wires attach to a box
@@ -932,8 +938,8 @@ class Diagram:
                 break
         return best
 
-    def _optimise(self):
-        """Walk the ladder, keeping the best arrangement seen at every step."""
+    def _ladder(self):
+        """One walk of the crossing ladder, keeping the best arrangement seen."""
         self._hint, self._boost = None, set()
         self._layout()
         n = self._untangle()
@@ -947,6 +953,45 @@ class Diagram:
                 self._restore(state)
         self._restore(state)
         return best
+
+    def _optimise(self):
+        """Walk the ladder; if wires are still illegal, give the outside bands more room.
+
+        A detour round the outside is only a route when the band it runs along has space,
+        and in a flat wide figure the bands above and below every box are the ONLY
+        horizontal corridors -- five tracks for the whole drawing with the default gap, so
+        one clock fan can take all of them. After that a wire needing to get past a column
+        has nowhere legal and is drawn through the boxes.
+
+        The retry is deliberately LAST, after the full ladder, and that ordering is the
+        whole point: the ladder repairs most violations on its own by reordering and
+        moving, so escalating on the first plain route widened figures that did not need
+        it and moved wires in drawings that were already clean. Judged here on
+        `_quality()` -- violations first, crossings only as the tie-break -- so a wider
+        band is never kept for prettiness, and a figure that comes out of the ladder legal
+        is left exactly as it was.
+        """
+        # Derived fresh every call. `_optimise` runs once for lint() and again for the
+        # SVG, and a band left wide from the previous call would make the second run start
+        # somewhere the first never was -- the drawn figure then differs from the linted
+        # one, which is the exact hazard lint(reroute=True) exists to avoid.
+        self._band_lanes = 0
+        best = self._ladder()
+        if not self._quality()[0]:
+            return best                  # legal already: the drawing is untouched
+        keep = (self._quality(), 0, self._state(), best)
+        for lanes in (8, 16):
+            self._band_lanes = lanes
+            n = self._ladder()
+            q = self._quality()
+            if q < keep[0]:
+                keep = (q, lanes, self._state(), n)
+            if not q[0]:
+                return n
+            # A wider band that fixed nothing is just a taller picture.
+        self._band_lanes = keep[1]
+        self._restore(keep[2])
+        return keep[3]
 
     def _untangle_keep(self):
         """_untangle() again, now that the modules have moved."""
@@ -969,10 +1014,25 @@ class Diagram:
                 self.gap_x, self.gap_x)
         return self._vgap_cache
 
+    def _band_reserve(self):
+        """How much clear space to keep above every box and below every box.
+
+        A detour round the outside is only a route if the band it runs along has room. A
+        flat, wide figure has exactly TWO horizontal corridors -- above everything and
+        below everything -- so with the default gap they hold five tracks between them,
+        and a clock fan alone can take all five. After that every wire needing to get
+        past a column has nowhere legal to go and gets drawn through the boxes.
+
+        So the band grows, but only when routing has actually failed without it: see
+        `_optimise`. Zero extra lanes is the default, so a figure that never needed the
+        room is laid out exactly as before.
+        """
+        return self.gap_y + getattr(self, "_band_lanes", 0) * LANE
+
     def _hgap_spans(self):
         if getattr(self, "_hgap_cache", None) is None:
             out = self._free_spans([(b.y, b.bottom) for b in self.boxes.values()],
-                                   self.gap_y, self.gap_y)
+                                   self._band_reserve(), self._band_reserve())
             # Never above the title -- a corridor at the very top drew wires straight
             # through the diagram's own heading.
             self._hgap_cache = [(max(lo, self.title_h + 6), hi) for lo, hi in out
@@ -1161,6 +1221,22 @@ class Diagram:
                 cross += c
             return cross, homeless, total
 
+        def fallback():
+            """The path drawn when nothing legal was found: the simple shape, on a track
+            no one else is using if one exists, leaving the lint to report it rather than
+            hiding the failure. Hoisted out so the detour below can ask what WOULD be
+            drawn, and stay out of the way when that is already fine."""
+            for mx in vt:
+                pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
+                if all(not (-3 < yy - y < 3
+                            and max(min(a[0], b[0]), xx0) < min(max(a[0], b[0]), xx1) - 2)
+                       for a, b in [(pts[0], pts[1]), (pts[2], pts[3])]
+                       for y in [a[1]]
+                       for band in (int(y // B) - 1, int(y // B), int(y // B) + 1)
+                       for yy, xx0, xx1 in uh_by_y.get(band, ())):
+                    return pts
+            return [sp, (default, sp[1]), (default, dp[1]), dp]
+
         best = None
         vt = self._tracks(self._vgap_spans(), default)
         # The length of each candidate is arithmetic -- no need to enter the evaluator to
@@ -1222,22 +1298,98 @@ class Diagram:
                         break
                 if done:
                     break
+        # A detour is for a wire that would otherwise be drawn ILLEGALLY, and for nothing
+        # else. `best is None` is not by itself that case: the evaluator also rejects a
+        # path for reasons that are matters of taste rather than of truth -- an arrowhead
+        # approached over too short a run, a route that doubles back, a name with nowhere
+        # to sit -- and a wire failing only those still gets a fallback that passes under
+        # no box at all. Sending those the long way round changed drawings that were
+        # already correct (on the eight-diagram corpus: one figure 7 crossings -> 12) to
+        # buy nothing. So ask what would actually be drawn, and step in only if it lies.
+        # ...and the test is specifically "does it pass under a box", not the router's
+        # own broader notion of illegal. Those differ: `seg_cross` also refuses a path
+        # that runs within a few px of another wire, a tolerance tighter than the lint's,
+        # so gating on it sent wires round the outside whose fallback the finished drawing
+        # was perfectly happy with -- two of the eight sample figures moved for nothing. A
+        # box is the case worth a long detour, because a wire drawn under one claims a
+        # connection through a block that does not exist.
+        fb = fallback() if best is None else None
+        if fb is not None and any(
+                _seg_in_box(sg, b)
+                for sg in zip(fb, fb[1:]) if sg[0] != sg[1]
+                for b in self.boxes.values() if b.id not in skip_ids):
+            # Nothing legal anywhere in the interior: every corridor between the two
+            # boxes is either under a box or already carrying a wire. This is the case
+            # that used to fall through to the illegal path below -- a long cross-level
+            # wire in a crowded grid, drawn straight under whatever stood in the way.
+            #
+            # So go round the OUTSIDE. The bands above every box and below every box are
+            # the only horizontal space in a figure guaranteed to hold no box at all,
+            # which is what makes them safe when a wire has to get past a whole column:
+            # dropping "just outside the two boxes" only works when nothing else shares
+            # their column, and in a real hierarchy something always does.
+            #
+            # Reachable only from here, and that is deliberate. The interior search above
+            # takes the ten tracks nearest the wire's own midpoint, so the outer bands
+            # are always sorted out of range -- they exist as corridors and were simply
+            # never tried. Gating the detour on "nothing legal exists" makes it strictly
+            # a last resort: a route the interior can serve is never sent the long way
+            # round, and no drawing that already had a legal path can change.
+            spans = self._hgap_spans()
+            outer = []
+            if spans:
+                # outermost first: the top band from its top edge, the bottom from its
+                # bottom edge, so a detour hugs the rim rather than cutting back inside
+                top = min(spans, key=lambda s: s[0])
+                bot = max(spans, key=lambda s: s[1])
+                for span, near in ((top, top[0]), (bot, bot[1])):
+                    # Every lane the band has, not a fixed few. The wire that needs this
+                    # route most is the one crossing the whole figure, it is routed last
+                    # because it is longest, and it therefore meets a band already full
+                    # of the short runs. Capping the candidates at four made the extra
+                    # lanes `_optimise` reserves invisible to the search that asked
+                    # for them -- the band grew and nothing could use it.
+                    outer += self._tracks([span], near)[:16]
+            # The legs out and back may themselves need an outer corridor, so the track
+            # lists are wider here than in the interior pass -- this runs for a handful
+            # of wires in a whole figure, not for every wire.
+            #
+            # Kept on-canvas: the leftmost vertical corridor starts a whole gap_x to the
+            # left of the first box, so it is usually at a NEGATIVE x. The interior pass
+            # never reaches those tracks because it takes the ten nearest the wire, but a
+            # wider list does, and the canvas only ever grows right and down -- a leg at
+            # negative x would simply be cropped out of the drawing.
+            def on_canvas(ts):
+                return [t for t in ts if t > self.margin / 2]
+
+            vt_o = on_canvas(vt)[:20]
+            xt_o = on_canvas(self._tracks(self._vgap_spans(), dp[0]))[:20]
+            for my in outer:
+                for mx in vt_o:
+                    if seg_cross(sp, (mx, sp[1])) is None:
+                        continue
+                    if seg_cross((mx, sp[1]), (mx, my)) is None:
+                        continue
+                    for ex in xt_o:
+                        if seg_cross((ex, dp[1]), dp) is None:
+                            continue
+                        if seg_cross((ex, my), (ex, dp[1])) is None:
+                            continue
+                        pts = [sp, (mx, sp[1]), (mx, my), (ex, my), (ex, dp[1]), dp]
+                        c = ok_and_cost(pts)
+                        if c and (best is None or (c, 4) < best[0]):
+                            best = ((c, 4), pts)
+                            if c[0] == 0:
+                                break      # legal and crossing nothing; take it
+                    if best is not None and best[0][0][0] == 0:
+                        break
+                if best is not None and best[0][0][0] == 0:
+                    break
         if best is not None:
             self._remember(best[1])
             return best[1]
 
-        # Nothing legal. Keep the simple shape, on a track no one else is using if one
-        # exists, and let the lint report it rather than hiding the failure.
-        for mx in vt:
-            pts = [sp, (mx, sp[1]), (mx, dp[1]), dp]
-            if all(not (-3 < yy - y < 3 and max(min(a[0], b[0]), xx0) < min(max(a[0], b[0]), xx1) - 2)
-                   for a, b in [(pts[0], pts[1]), (pts[2], pts[3])]
-                   for y in [a[1]]
-                   for band in (int(y // B) - 1, int(y // B), int(y // B) + 1)
-                   for yy, xx0, xx1 in uh_by_y.get(band, ())):
-                self._remember(pts)
-                return pts
-        pts = [sp, (default, sp[1]), (default, dp[1]), dp]
+        pts = fallback()
         self._remember(pts)
         return pts
 
@@ -2020,6 +2172,65 @@ def _selftest():
     d28.box("a", 0, 0, "A"); d28.box("b", 1, 0, "B")
     d28.edge("a", "b", label="d [64]")
     check("effort: a full draw carries no note", not d28.lint())
+
+    # ---- round the outside, and the room to do it ---------------------------------
+    # One source feeding boxes spread across several columns -- a clock/reset fan, which
+    # is as ordinary as a diagram gets. Its own earlier legs take the interior corridors,
+    # so a later one has nothing legal left and used to be drawn straight through the
+    # boxes in the way: ten boxes and seventeen wires produced THREE wires under a box.
+    #
+    # Two things have to hold for the detour to work, and they are tested separately
+    # because each was broken on its own. The band above and below every box is the only
+    # horizontal space guaranteed to hold no box, so that is where such a wire goes --
+    # and in a flat wide figure those two bands are the ONLY horizontal corridors, five
+    # tracks for the whole drawing, so the band also has to be given room to hold it.
+    # Drawn at fast effort: the gate must stay quick, and legality is not an effort
+    # setting -- see the fast-mode checks above.
+    def _fan3(effort="fast"):
+        d = Diagram("clock fan across three columns", effort=effort)
+        d.node("clk", "ClockSource", ["clk + rst"], kind="emphasis")
+        prev = None
+        for c in range(3):
+            for r in range(3):
+                b = f"f{c}_{r}"
+                d.node(b, f"Blk{c}{r}")
+                d.edge("clk", b, label="clk/rst", kind="clock")
+                if prev:
+                    d.edge(prev, b, label="tl [64]", weight="bus")
+                prev = b
+        return d
+
+    d29 = _fan3()
+    rep29 = d29.lint()
+    check("around: a crowded fan draws no wire under a box",
+          not any("crosses box" in m for l, m in rep29 if l == "FAIL"))
+    check("around: and none along another wire",
+          not any("stacked" in m for l, m in rep29 if l == "FAIL"))
+    # the room was taken because it was needed, and the band it opened is real space
+    check("band: widened only because the route needed it",
+          getattr(d29, "_band_lanes", 0) > 0)
+    top29 = min(b.y for b in d29.boxes.values())
+    bot29 = max(b.bottom for b in d29.boxes.values())
+    outside = [p for e in d29.edges for p in e.pts if p[1] < top29 - 1 or p[1] > bot29 + 1]
+    check("around: the detour runs outside every box, not between them", bool(outside))
+    # ...and NOT taken otherwise: a figure that already routes cleanly must come out
+    # byte-identical, which is what makes this safe to have on by default.
+    d30 = Diagram("small and clean", cols=2, rows=2)
+    d30.box("a", 0, 0, "A"); d30.box("b", 1, 0, "B"); d30.box("c", 1, 1, "C")
+    d30.edge("a", "b", label="x [64]"); d30.edge("a", "c", label="y [64]")
+    d30.lint()
+    check("band: left alone when nothing needed it",
+          getattr(d30, "_band_lanes", 0) == 0)
+    # The band is a piece of state that survives a call, and lint() then the SVG each
+    # optimise once. If the second run inherited the first one's band it would start from
+    # a layout the first never saw, and the figure on disk would not be the figure that was
+    # linted -- reported clean while drawn otherwise.
+    d31 = _fan3()
+    d31.lint()
+    drawn31 = [tuple(p) for e in d31.edges for p in e.pts]
+    d31._svg()
+    check("band: the figure drawn is the figure that was linted",
+          drawn31 == [tuple(p) for e in d31.edges for p in e.pts])
 
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}")
     return fails

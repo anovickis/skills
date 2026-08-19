@@ -1,5 +1,75 @@
 # Changelog — `blockdiagram` skill
 
+## 0.7.2 — round the outside, and the room to do it
+A wire with nowhere legal to go was drawn straight through whatever stood in the way. Ten
+boxes and seventeen wires were enough to produce it: **one clock fan across three columns,
+three wires under a box.** On a five-level hierarchy with twenty cross-level wires it was
+five FAILs, all from a single clock leg — four boxes crossed and one stacked run.
+
+The router already searched three-segment paths and then five-segment ones, and when none
+was legal it kept the simple shape and let the lint report it. What it never tried is the
+one space a figure is guaranteed to have: the band above every box and the band below
+every box. Those corridors existed all along — `_free_spans` returns them — but the search
+takes the ten tracks nearest the wire's own midpoint, so the outer bands always sorted out
+of range. They were never tried, not rejected.
+
+- **A detour, as the last resort only.** Out to a vertical track, along the outer band past
+  everything, back in at the far side. Reached only when no interior path is legal *and*
+  the path that would otherwise be drawn passes under a non-endpoint box, so a wire the
+  interior can serve is never sent the long way round.
+- **The band is given room when it needs it.** A detour is worthless if the band is full,
+  and a flat wide figure has only those two horizontal corridors — five tracks for the
+  whole drawing at the default gap, which one fan can take. When violations survive the
+  ladder, the band grows (8 lanes, then 16) and the ladder runs again, judged on
+  `_quality()`: violations first, crossings only as the tie-break, so a wider band is never
+  kept for prettiness.
+
+Measured, worst first. Every case that was FAILing is now clean at full effort:
+
+| case | before | after |
+|---|---|---|
+| clock fan, 3 columns (10 boxes, 17 wires) | 3 FAILs | **0** |
+| the same at 13 boxes, 23 wires (two shapes) | 16 FAILs | **0** |
+| 17 boxes, 31 wires | 51 FAILs | **0** |
+| five levels + 20 cross-level wires (48 boxes, 67 wires) | 5 FAILs | **0** |
+| the eight sample diagrams | 0 FAILs, 77 crossings | 0 FAILs, **76** |
+| merged hierarchy (53 boxes, 52 wires) | 0 FAILs, 103 crossings | 0 FAILs, **71** |
+| five-level SoC (45 boxes, 82 wires) | 0 FAILs, 199 crossings | 0 FAILs, **186** |
+
+The last two were already legal and got better anyway: a wire sent round the outside is a
+wire no longer cutting through the corridors, so the figures that were merely *crowded*
+gained too -- 103 crossings to 71 on the 53-box merge.
+
+Every case repaired above needed only the FIRST escalation step, 8 lanes. The 16-lane step
+has never yet been the one that helped; it costs nothing when 8 works (the loop stops as
+soon as the figure is legal) and is kept as margin rather than as a measured need. The
+five-level SoC pays for it in time, though: ~6.5 min to ~14, because it takes a second walk
+of the ladder to get there. A figure that is already legal after the first walk pays
+nothing.
+
+Three things stated plainly rather than buried.
+
+**Two of the eight figures move.** 03 goes 7 crossings to 12, 04 goes 9 to 3 — net one
+better, both still FAIL-free, and one canvas a single pixel narrower. Neither draws an
+illegal wire in its *final* arrangement, so nothing was repaired there; the detour also
+applies while the ladder is exploring, so it shifts which arrangement the ladder settles
+on. Byte-identity was reachable only by making the search and the final draw disagree with
+each other, which is how silent bugs get made.
+
+**The gates were each bought with a wrong answer.** Triggering on the router's own broader
+notion of illegal — which refuses a path running within a few px of another wire, tighter
+than the lint's tolerance — moved clean figures for nothing. Widening the band after the
+*first* route rather than after the ladder did the same, because the ladder repairs most
+violations by itself. Both were caught by re-measuring the eight, not by reading the code.
+
+**Fast effort is still not clean on the worst case:** the 17-box fan keeps 15 FAILs at
+`effort="fast"` against 99 before. The draft setting's shortened ladder cannot reach the
+arrangement full effort finds, so on that input `fast` does trade legality, contrary to what
+0.7.0 claims for it. Improved, not fixed, and it predates this change.
+
+Selftest 42 checks -> 47; ALL PASS. Corpus of eight full-effort: 43.8s -> 44.9s (the ladder
+re-runs only for a figure that is still illegal after it).
+
 ## 0.7.1 — a draft that says it is one
 The effort setting now travels with the output three ways: the lint summary names it
 (`lint: OK (effort=fast)`), a fast draw adds a `NOTE` line saying what was traded, and the
